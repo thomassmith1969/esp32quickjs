@@ -11,6 +11,7 @@
 
 #ifdef ENABLE_WIFI
 #include <HTTPClient.h>
+#include <Server.h>
 #include <StreamString.h>
 #endif
 
@@ -136,7 +137,206 @@ class JSHttpFetcher {
     }
   }
 };
-#endif  // ENABLE_WIFI
+
+class JSConnection {
+public:
+    WiFiClient* client;
+    JSContext* ctx;
+    
+    struct PendingOp {
+        enum Type { READ, WRITE, CLOSE };
+        Type type;
+        JSValue resolve;
+        JSValue reject;
+        std::string data;
+        uint32_t len;
+    };
+    std::vector<PendingOp*> pending;
+
+    JSConnection(JSContext* ctx, WiFiClient* client) : ctx(ctx), client(client) {}
+    ~JSConnection() {
+        for (auto p : pending) {
+            JS_FreeValue(ctx, p->resolve);
+            JS_FreeValue(ctx, p->reject);
+            delete p;
+        }
+        if (client) delete client;
+    }
+
+    void poll() {
+        auto it = pending.begin();
+        while (it != pending.end()) {
+            PendingOp* op = *it;
+            bool resolved = false;
+            if (op->type == JSConnection::PendingOp::READ) {
+                if (client->available() > 0) {
+                    int available = client->available();
+                    int toRead = std::min(available, (int)op->len);
+                    std::vector<char> buf(toRead);
+                    client->readBytes(buf.data(), toRead);
+                    JSValue res = JS_NewString(ctx, buf.data());
+                    JS_Call(ctx, op->resolve, JS_UNDEFINED, 1, &res);
+                    JS_FreeValue(ctx, res);
+                    resolved = true;
+                }
+            } else if (op->type == JSConnection::PendingOp::WRITE) {
+                if (client->availableForWrite() > 0) {
+                    client->write((const uint8_t*)op->data.c_str(), op->data.length());
+                    JSValue res = JS_NewBool(ctx, true);
+                    JS_Call(ctx, op->resolve, JS_UNDEFINED, 1, &res);
+                    JS_FreeValue(ctx, res);
+                    resolved = true;
+                }
+            } else if (op->type == JSConnection::PendingOp::CLOSE) {
+                client->stop();
+                JSValue res = JS_NewBool(ctx, true);
+                JS_Call(ctx, op->resolve, JS_UNDEFINED, 1, &res);
+                JS_FreeValue(ctx, res);
+                resolved = true;
+            }
+
+            if (resolved) {
+                JS_FreeValue(ctx, op->resolve);
+                JS_FreeValue(ctx, op->reject);
+                delete op;
+                it = pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+};
+
+class JSWebServer {
+    WiFiServer server;
+    JSValue callback = JS_UNDEFINED;
+    JSContext* ctx = nullptr;
+    std::vector<JSConnection*> connections;
+
+public:
+    void serve(JSContext* ctx, uint16_t port, JSValue callback) {
+        this->ctx = ctx;
+        this->callback = JS_DupValue(ctx, callback);
+        server.begin(port);
+    }
+
+    void loop() {
+        if (!ctx) return;
+
+        WiFiClient client = server.available();
+        if (client) {
+            JSConnection* conn = new JSConnection(ctx, new WiFiClient(client));
+            connections.push_back(conn);
+            
+            JSValue jsConn = createConnection(ctx, conn);
+            JS_Call(ctx, callback, JS_UNDEFINED, 1, &jsConn);
+            JS_FreeValue(ctx, jsConn);
+        }
+
+        auto it = connections.begin();
+        while (it != connections.end()) {
+            JSConnection* conn = *it;
+            if (!conn->client || !conn->client->connected()) {
+                delete conn;
+                it = connections.erase(it);
+            } else {
+                conn->poll();
+                ++it;
+            }
+        }
+    }
+
+    static JSValue createConnection(JSContext* ctx, JSConnection* conn) {
+        JSValue obj = JS_NewObject(ctx);
+        JSValue ptr = JS_NewUint32(ctx, (uintptr_t)conn);
+        JS_SetPropertyStr(ctx, obj, "__conn_ptr", ptr);
+        JS_FreeValue(ctx, ptr);
+
+        static const JSCFunctionListEntry conn_funcs[] = {
+            {"read", 1, JS_DEF_CFUNC, 0, {func: {1, JS_CFUNC_generic, conn_read}}},
+            {"write", 1, JS_DEF_CFUNC, 0, {func: {1, JS_CFUNC_generic, conn_write}}},
+            {"close", 0, JS_DEF_CFUNC, 0, {func: {0, JS_CFUNC_generic, conn_close}}},
+        };
+        JS_SetPropertyFunctionList(ctx, obj, conn_funcs, 3);
+        return obj;
+    }
+
+    static JSValue conn_read(JSContext* ctx, JSValueConst jsThis, int argc, JSValueConst* argv) {
+        JSValue ptrVal = JS_GetPropertyStr(ctx, (JSValue)jsThis, "__conn_ptr");
+        uint32_t ptr;
+        JS_ToUint32(ctx, &ptr, ptrVal);
+        JS_FreeValue(ctx, ptrVal);
+        JSConnection* conn = (JSConnection*)ptr;
+        
+        uint32_t len = 1024;
+        if (argc > 0) {
+            JS_ToUint32(ctx, &len, argv[0]);
+        }
+
+        JSValue resolving_funcs[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+        
+        JSConnection::PendingOp* op = new JSConnection::PendingOp{
+            JSConnection::PendingOp::Type::READ,
+            JS_DupValue(ctx, resolving_funcs[0]),
+            JS_DupValue(ctx, resolving_funcs[1]),
+            "",
+            len
+        };
+        conn->pending.push_back(op);
+
+        return promise;
+    }
+
+    static JSValue conn_write(JSContext* ctx, JSValueConst jsThis, int argc, JSValueConst* argv) {
+        JSValue ptrVal = JS_GetPropertyStr(ctx, (JSValue)jsThis, "__conn_ptr");
+        uint32_t ptr;
+        JS_ToUint32(ctx, &ptr, ptrVal);
+        JS_FreeValue(ctx, ptrVal);
+        JSConnection* conn = (JSConnection*)ptr;
+        
+        const char* data = JS_ToCString(ctx, argv[0]);
+        if (!data) return JS_EXCEPTION;
+
+        JSValue resolving_funcs[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+        
+        JSConnection::PendingOp* op = new JSConnection::PendingOp{
+            JSConnection::PendingOp::Type::WRITE,
+            JS_DupValue(ctx, resolving_funcs[0]),
+            JS_DupValue(ctx, resolving_funcs[1]),
+            std::string(data),
+            0
+        };
+        conn->pending.push_back(op);
+
+        JS_FreeCString(ctx, data);
+        return promise;
+    }
+
+    static JSValue conn_close(JSContext* ctx, JSValueConst jsThis, int argc, JSValueConst* argv) {
+        JSValue ptrVal = JS_GetPropertyStr(ctx, (JSValue)jsThis, "__conn_ptr");
+        uint32_t ptr;
+        JS_ToUint32(ctx, &ptr, ptrVal);
+        JS_FreeValue(ctx, ptrVal);
+        JSConnection* conn = (JSConnection*)ptr;
+
+        JSValue resolving_funcs[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+        
+        JSConnection::PendingOp* op = new JSConnection::PendingOp{
+            JSConnection::PendingOp::Type::CLOSE,
+            JS_DupValue(ctx, resolving_funcs[0]),
+            JS_DupValue(ctx, resolving_funcs[1]),
+            "",
+            0
+        };
+        conn->pending.push_back(op);
+
+        return promise;
+    }
+};
+#endif
 
 class JSTimer {
   // 20 bytes / entry.
@@ -212,6 +412,7 @@ class ESP32QuickJS {
   JSValue loop_func = JS_UNDEFINED;
 #ifdef ENABLE_WIFI
   JSHttpFetcher httpFetcher;
+  JSWebServer webServer;
 #endif
 
   void begin() {
@@ -254,6 +455,7 @@ class ESP32QuickJS {
 
 #ifdef ENABLE_WIFI
     httpFetcher.loop(ctx);
+    webServer.loop();
 #endif
 
     // loop()
@@ -277,7 +479,7 @@ class ESP32QuickJS {
 
   JSValue eval(const char *code) {
     JSValue ret =
-        JS_Eval(ctx, code, strlen(code), "<eval>", JS_EVAL_TYPE_MODULE);
+        JS_Eval(ctx, code, strlen(code), "<eval>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(ret)) {
       qjs_dump_exception(ctx, ret);
     }
@@ -316,6 +518,43 @@ class ESP32QuickJS {
     JS_SetPropertyStr(ctx, global, "clearInterval",
                       JS_NewCFunction(ctx, clear_timeout, "clearInterval", 1));
 
+#ifdef ENABLE_WIFI
+    JSValue wifi = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, global, "WiFi", wifi);
+    
+    static const JSCFunctionListEntry wifi_funcs[] = {
+        JSCFunctionListEntry{"connected", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, wifi_is_connected}
+                             }},
+        JSCFunctionListEntry{"connect", 2, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, wifi_connect}
+                             }},
+        JSCFunctionListEntry{"reconnect", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, wifi_reconnect}
+                             }},
+        JSCFunctionListEntry{"startAP", 1, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, wifi_start_ap}
+                             }},
+        JSCFunctionListEntry{"stopAP", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, wifi_stop_ap}
+                             }},
+        JSCFunctionListEntry{"stop", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, wifi_stop}
+                             }},
+        JSCFunctionListEntry{"fetch", 2, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, http_fetch}
+                             }},
+        JSCFunctionListEntry{"ip", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, wifi_ip}
+                             }},
+        JSCFunctionListEntry{"serve", 2, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, wifi_serve}
+                             }},
+    };
+    JS_SetPropertyFunctionList(ctx, wifi, wifi_funcs, sizeof(wifi_funcs) / sizeof(JSCFunctionListEntry));
+    // Do not free wifi here, it is owned by the global object
+#endif
+
     static const JSCFunctionListEntry esp32_funcs[] = {
         JSCFunctionListEntry{"millis", 0, JS_DEF_CFUNC, 0, {
                                func : {0, JS_CFUNC_generic, esp32_millis}
@@ -337,14 +576,6 @@ class ESP32QuickJS {
         JSCFunctionListEntry{"setLoop", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_set_loop}
                              }},
-#ifdef ENABLE_WIFI
-        JSCFunctionListEntry{"isWifiConnected", 0, JS_DEF_CFUNC, 0, {
-                               func : {0, JS_CFUNC_generic, wifi_is_connected}
-                             }},
-        JSCFunctionListEntry{"fetch", 0, JS_DEF_CFUNC, 0, {
-                               func : {2, JS_CFUNC_generic, http_fetch}
-                             }},
-#endif
     };
 
 #ifndef GLOBAL_ESP32
@@ -459,6 +690,70 @@ class ESP32QuickJS {
   static JSValue wifi_is_connected(JSContext *ctx, JSValueConst jsThis,
                                    int argc, JSValueConst *argv) {
     return JS_NewBool(ctx, WiFi.status() == WL_CONNECTED);
+  }
+
+  static JSValue wifi_connect(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_EXCEPTION;
+    const char *ssid = JS_ToCString(ctx, argv[0]);
+    const char *pass = JS_ToCString(ctx, argv[1]);
+    if (!ssid || !pass) return JS_EXCEPTION;
+    
+    bool success = WiFi.begin(ssid, pass);
+    
+    JS_FreeCString(ctx, ssid);
+    JS_FreeCString(ctx, pass);
+    return JS_NewBool(ctx, success);
+  }
+
+  static JSValue wifi_reconnect(JSContext *ctx, JSValueConst jsThis,
+                                 int argc, JSValueConst *argv) {
+    WiFi.disconnect();
+    WiFi.begin();
+    return JS_UNDEFINED;
+  }
+
+  static JSValue wifi_start_ap(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_EXCEPTION;
+    const char *ssid = JS_ToCString(ctx, argv[0]);
+    if (!ssid) return JS_EXCEPTION;
+    
+    bool success = WiFi.softAP(ssid);
+    JS_FreeCString(ctx, ssid);
+    return JS_NewBool(ctx, success);
+  }
+
+  static JSValue wifi_stop_ap(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    WiFi.softAP(NULL);
+    return JS_UNDEFINED;
+  }
+
+  static JSValue wifi_stop(JSContext *ctx, JSValueConst jsThis,
+                           int argc, JSValueConst *argv) {
+    WiFi.disconnect();
+    return JS_UNDEFINED;
+  }
+
+  static JSValue wifi_ip(JSContext *ctx, JSValueConst jsThis,
+                         int argc, JSValueConst *argv) {
+    IPAddress ip = WiFi.localIP();
+    char buf[16];
+    sprintf(buf, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    return JS_NewString(ctx, buf);
+  }
+
+  static JSValue wifi_serve(JSContext *ctx, JSValueConst jsThis, int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_EXCEPTION;
+    uint32_t port;
+    JS_ToUint32(ctx, &port, argv[0]);
+    JSValue callback = argv[1];
+    if (!JS_IsFunction(ctx, callback)) return JS_EXCEPTION;
+
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    qjs->webServer.serve(ctx, (uint16_t)port, callback);
+    return JS_UNDEFINED;
   }
 
   static JSValue http_fetch(JSContext *ctx, JSValueConst jsThis, int argc,
