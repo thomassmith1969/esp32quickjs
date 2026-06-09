@@ -18,6 +18,12 @@
 #define ENABLE_ESPNOW
 #endif
 
+// Forward declaration of the main embed class. JSAnalog (defined
+// above ESP32QuickJS in this file) needs to look up the qjs
+// instance to fire its dispose() callback; the forward decl lets us
+// reference ESP32QuickJS* without a circular include.
+class ESP32QuickJS;
+
 #include <Arduino.h>
 
 #include <algorithm>
@@ -94,6 +100,29 @@ static void qjs_dump_exception(JSContext *ctx, JSValue v) {
   // Note: this POPS the exception from the pending slot, so the caller
   // must not also call JS_GetException.
   qjs_dump_exception_to(ctx, v, activeOutputStream ? (Print*)activeOutputStream : nullptr);
+}
+
+// Stringify a JS value and print it to a specific Stream* using
+// JSON.stringify. Used by the REPL to print Promise resolutions back
+// to the originating client. The caller may pass nullptr to fall back
+// to Serial. The Stream* is captured by value (not dereferenced for
+// ownership); the caller is responsible for keeping it alive (or
+// accepting that writes after disconnect are no-ops).
+static void qjs_print_value_to(JSContext *ctx, JSValueConst v, Print* out) {
+  if (!out) out = &Serial;
+  JSValue global = JS_GetGlobalObject(ctx);
+  JSValue json = JS_GetPropertyStr(ctx, global, "JSON");
+  JSValue stringify = JS_GetPropertyStr(ctx, json, "stringify");
+  JSValue strResult = JS_Call(ctx, stringify, JS_UNDEFINED, 1, &v);
+  const char *str = JS_ToCString(ctx, strResult);
+  if (str) {
+    out->println(str);
+    JS_FreeCString(ctx, str);
+  }
+  JS_FreeValue(ctx, strResult);
+  JS_FreeValue(ctx, stringify);
+  JS_FreeValue(ctx, json);
+  JS_FreeValue(ctx, global);
 }
 
 #ifdef ENABLE_WIFI
@@ -499,6 +528,377 @@ class JSTimer {
     return !t.empty();
   }
 };
+
+// ----------------------------------------------------------------------------
+// JSAnalog: Promise-based analog I/O and touch listener.
+//
+// Three operations are exposed to JS (all on the `esp32` global):
+//   - readAnalog(pin, [resolution=12])     → Promise<int>
+//   - writeAnalog(pin, duty, [freq=5000],  → Promise<{ channel }>
+//                  [resolution=8])
+//   - writeAnalogStop(channel)             → Promise<void>
+//   - touch(pin, threshold, callback)      → dispose() function
+//
+// Why promises for synchronous hardware? Two reasons:
+//   1. Keeps the JS API uniform: every I/O op returns a Promise.
+//   2. Allows the main loop to do all the work in one place
+//      (JSAnalog::loop) so the JS engine never blocks on hardware.
+//
+// Touch listeners use touchAttachInterrupt under the hood. The C ISR
+// runs in interrupt context (cannot safely call into QuickJS), so the
+// ISR only sets a volatile flag; the JS callback is dispatched from
+// JSAnalog::loop() on the main task, where it's safe.
+// ----------------------------------------------------------------------------
+class JSAnalog {
+  // -- readAnalog: queue of pending ADC reads --
+  struct ReadEntry {
+    uint8_t pin;
+    uint8_t resolution;  // 9..12 bits
+    JSValue resolving_funcs[2];
+  };
+  std::vector<ReadEntry> readQueue;
+
+  // -- writeAnalog: queue of pending PWM setup/teardown --
+  struct WriteEntry {
+    uint8_t pin;
+    uint8_t is_stop;       // 0 = attach+write, 1 = stop
+    uint8_t resolution;    // 1..16 bits
+    uint8_t channel;       // LEDC channel (allocated during processing)
+    uint32_t frequency;
+    uint32_t duty;         // 0..2^resolution-1
+    JSValue resolving_funcs[2];
+  };
+  std::vector<WriteEntry> writeQueue;
+
+  // Channel allocator. The legacy Arduino-ESP32 LEDC API
+  // (ledcSetup/ledcAttachPin/ledcWrite/ledcDetachPin) requires the
+  // caller to specify a channel (0..15). We allocate from a bitmap
+  // so the user doesn't have to. Channel 0 is reserved for
+  // Arduino-internal use (Tone.cpp), so we start at 1 and allow up
+  // to LEDC_CHANNELS-1.
+  static const int LEDC_CHANNELS = 16;
+  uint32_t channelBitmap = 0;  // bit i = channel i allocated
+  int allocChannel() {
+    for (int i = 1; i < LEDC_CHANNELS; i++) {
+      if (!(channelBitmap & (1U << i))) {
+        channelBitmap |= (1U << i);
+        return i;
+      }
+    }
+    return -1;
+  }
+  void freeChannel(int ch) {
+    if (ch >= 0 && ch < LEDC_CHANNELS) channelBitmap &= ~(1U << ch);
+  }
+
+  // pin → channel map. Lets writeAnalogStop(pin) find the channel to
+  // free. Index 0 means "no channel / not currently in use for PWM".
+  // 0xFF sentinel means "invalid pin index, out of range".
+  static const uint8_t PIN_UNUSED = 0;
+  static const uint8_t PIN_INVALID = 0xFF;
+  uint8_t pinChannel[40];
+  void setPinChannel(uint8_t pin, uint8_t ch) {
+    if (pin < 40) pinChannel[pin] = ch;
+  }
+  uint8_t getPinChannel(uint8_t pin) {
+    if (pin >= 40) return PIN_INVALID;
+    return pinChannel[pin];
+  }
+
+  // -- touch listeners --
+  struct TouchListener {
+    uint8_t pin;
+    uint16_t threshold;
+    // JS callback. Stays valid for the lifetime of the listener.
+    // Released in removeTouch() or end().
+    JSValue js_callback;
+    // Set by the ISR; consumed by loop() to dispatch the JS callback.
+    volatile bool touched;
+    // Stored as a pointer because the C API takes `void*` we can
+    // back-reference; the ISR uses this to find the listener.
+    bool active;
+  };
+  // Index 1..MAX_TOUCH. Index 0 unused so we can store id as 0 = "no
+  // listener". Capped to keep memory bounded; the user can dispose
+  // old listeners to free slots.
+  static const int MAX_TOUCH = 8;
+  TouchListener listeners[MAX_TOUCH + 1];
+
+  // Helper: register a touch interrupt on a free slot. Returns the
+  // id (1..MAX_TOUCH) on success, 0 on failure.
+  //
+  // threshold semantics: 0 = auto. We sample the current (untouched)
+  // reading and set the threshold to 2/3 of that, so a touch (which
+  // typically drops the reading well below 2/3 of baseline) fires
+  // the interrupt once. The actual interrupt also fires on the
+  // *release* edge (reading crosses back up), but loop() debounces
+  // by only dispatching on state transitions, so the JS callback
+  // fires once per touch, not on every ISR.
+  int addTouch(JSContext* ctx, uint8_t pin, uint16_t threshold,
+               JSValue callback) {
+    int slot = -1;
+    for (int i = 1; i <= MAX_TOUCH; i++) {
+      if (!listeners[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return 0;
+    int8_t pad = digitalPinToTouchChannel(pin);
+    if (pad < 0) {
+      Serial.printf("[analog] touch: pin %u is not a touch pad\n", pin);
+      return 0;
+    }
+    // Read the baseline for diagnostic logging. Do NOT auto-pick a
+    // threshold from it; the user-supplied threshold is authoritative
+    // (touch was working, don't break it).
+    uint16_t baseline = touchRead(pin);
+    listeners[slot].pin = pin;
+    listeners[slot].threshold = threshold;
+    listeners[slot].js_callback = JS_DupValue(ctx, callback);
+    listeners[slot].touched = false;
+    listeners[slot].active = true;
+    Serial.printf("[analog] touch: pin=%u pad=%d slot=%d thr=%u baseline=%u\n",
+                  pin, (int)pad, slot, threshold, baseline);
+    // Attach the C-level ISR. We use touchAttachInterruptArg so the
+    // ISR can find its listener via the slot id we pass as the
+    // `arg` user-data pointer. The trampoline looks up the listener
+    // in the static `instance` pointer below.
+    touchAttachInterruptArg(
+        (uint8_t)pin,
+        [](void* arg) {
+          int id = (int)(intptr_t)arg;
+          TouchListener* tl = JSAnalog::findListener(id);
+          if (tl) tl->touched = true;
+        },
+        (void*)(intptr_t)slot, threshold);
+    return slot;
+  }
+
+  void removeTouch(JSContext* ctx, int id) {
+    if (id < 1 || id > MAX_TOUCH) return;
+    TouchListener& tl = listeners[id];
+    if (!tl.active) return;
+    // Detach the interrupt. touchDetachInterrupt is the inverse of
+    // touchAttachInterrupt. Falls back to no-op on cores that don't
+    // have it (older Arduino-ESP32).
+    #ifdef touchDetachInterrupt
+    touchDetachInterrupt(tl.pin);
+    #endif
+    JS_FreeValue(ctx, tl.js_callback);
+    tl.js_callback = JS_UNDEFINED;
+    tl.active = false;
+    tl.touched = false;
+  }
+
+  // Static lookup so the ISR (which is a free function) can find the
+  // listener that owns it. We use the same `instance` pattern as
+  // JSEspNow.
+  static JSAnalog* instance;
+  static TouchListener* findListener(int id) {
+    if (!instance || id < 1 || id > MAX_TOUCH) return nullptr;
+    if (!instance->listeners[id].active) return nullptr;
+    return &instance->listeners[id];
+  }
+
+ public:
+  // Reset all state. Called from end() and the constructor.
+  void clear() {
+    for (int i = 1; i <= MAX_TOUCH; i++) {
+      listeners[i].active = false;
+      listeners[i].touched = false;
+      listeners[i].js_callback = JS_UNDEFINED;
+    }
+    channelBitmap = 0;
+    for (int i = 0; i < 40; i++) pinChannel[i] = PIN_UNUSED;
+  }
+
+  // Called once during qjs.begin() to wire the static instance.
+  void init() { instance = this; clear(); }
+
+  // Called from qjs.end() to free everything.
+  void end(JSContext* ctx) {
+    for (int i = 1; i <= MAX_TOUCH; i++) {
+      if (listeners[i].active) {
+        removeTouch(ctx, i);
+      }
+    }
+    // Free any in-flight read/write queues. Reject pending promises.
+    for (auto& e : readQueue) {
+      JSValue r = JS_UNDEFINED;
+      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e.resolving_funcs[0]);
+      JS_FreeValue(ctx, e.resolving_funcs[1]);
+    }
+    readQueue.clear();
+    for (auto& e : writeQueue) {
+      JSValue r = JS_UNDEFINED;
+      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e.resolving_funcs[0]);
+      JS_FreeValue(ctx, e.resolving_funcs[1]);
+    }
+    writeQueue.clear();
+  }
+
+  // Drain one item from each queue. Returns immediately if empty.
+  void loop(JSContext* ctx) {
+    // --- Process one readAnalog request per tick. ADC reads are
+    // fast but we still rate-limit to keep the main loop snappy. ---
+    if (!readQueue.empty()) {
+      ReadEntry e = readQueue.front();
+      readQueue.erase(readQueue.begin());
+      int value = analogRead(e.pin);
+      JSValue r = JS_NewInt32(ctx, value);
+      JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e.resolving_funcs[0]);
+      JS_FreeValue(ctx, e.resolving_funcs[1]);
+    }
+    // --- Process one writeAnalog / writeAnalogStop per tick. ---
+    if (!writeQueue.empty()) {
+      WriteEntry e = writeQueue.front();
+      writeQueue.erase(writeQueue.begin());
+      if (e.is_stop) {
+        // Look up the channel that was used for this pin, free it,
+        // and detach the pin. ledcWrite(pin, 0) is a no-op on the
+        // legacy core; ledcDetachPin is the real detach. If the pin
+        // was never allocated, freeChannel(0) is a no-op.
+        uint8_t ch = getPinChannel(e.pin);
+        if (ch != PIN_INVALID && ch != PIN_UNUSED) {
+          ledcDetachPin(e.pin);
+          freeChannel(ch);
+          setPinChannel(e.pin, PIN_UNUSED);
+        }
+        JSValue r = JS_UNDEFINED;
+        JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
+        JS_FreeValue(ctx, r);
+      } else {
+        int ch = allocChannel();
+        if (ch >= 0) {
+          // Setup the channel at the requested freq/resolution, then
+          // attach the pin to it.
+          ledcSetup(ch, e.frequency, e.resolution);
+          ledcAttachPin(e.pin, ch);
+          // duty value 0..2^resolution-1
+          uint32_t maxDuty = (1UL << e.resolution) - 1;
+          uint32_t duty = e.duty > maxDuty ? maxDuty : e.duty;
+          ledcWrite(ch, duty);
+          // Remember which channel this pin uses so writeAnalogStop
+          // can free it later.
+          setPinChannel(e.pin, (uint8_t)ch);
+          // Resolve with { channel: ch }.
+          JSValue r = JS_NewObject(ctx);
+          JS_SetPropertyStr(ctx, r, "channel", JS_NewInt32(ctx, ch));
+          JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
+          JS_FreeValue(ctx, r);
+        } else {
+          // Reject.
+          JSValue r = JS_NewString(ctx, "no free LEDC channel");
+          JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &r);
+          JS_FreeValue(ctx, r);
+        }
+      }
+      JS_FreeValue(ctx, e.resolving_funcs[0]);
+      JS_FreeValue(ctx, e.resolving_funcs[1]);
+    }
+    // --- Dispatch any touch events flagged by ISRs. ---
+    for (int i = 1; i <= MAX_TOUCH; i++) {
+      TouchListener& tl = listeners[i];
+      if (!tl.active) continue;
+      if (!tl.touched) continue;
+      // Atomically read+clear so a re-trigger during dispatch is
+      // not lost.
+      tl.touched = false;
+      JSValue arg = JS_NewBool(ctx, true);
+      JSValue ret = JS_Call(ctx, tl.js_callback, JS_UNDEFINED, 1, &arg);
+      JS_FreeValue(ctx, arg);
+      if (JS_IsException(ret)) {
+        qjs_dump_exception(ctx, ret);
+      }
+      JS_FreeValue(ctx, ret);
+    }
+  }
+
+  // -- The four JS-callable entry points. Called from the static
+  // C trampolines below. --
+  JSValue js_readAnalog(JSContext* ctx, int argc, JSValueConst* argv) {
+    uint32_t pin, resolution = 12;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    if (argc >= 2) JS_ToUint32(ctx, &resolution, argv[1]);
+    if (resolution < 9) resolution = 9;
+    if (resolution > 12) resolution = 12;
+    analogSetPinAttenuation((uint8_t)pin, ADC_11db);
+    ReadEntry e;
+    e.pin = (uint8_t)pin;
+    e.resolution = (uint8_t)resolution;
+    readQueue.push_back(e);
+    return JS_NewPromiseCapability(ctx, readQueue.back().resolving_funcs);
+  }
+
+  JSValue js_writeAnalog(JSContext* ctx, int argc, JSValueConst* argv) {
+    uint32_t pin, duty, frequency = 5000, resolution = 8;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    JS_ToUint32(ctx, &duty, argv[1]);
+    if (argc >= 3) JS_ToUint32(ctx, &frequency, argv[2]);
+    if (argc >= 4) JS_ToUint32(ctx, &resolution, argv[3]);
+    if (resolution < 1) resolution = 1;
+    if (resolution > 16) resolution = 16;
+    WriteEntry e;
+    e.pin = (uint8_t)pin;
+    e.is_stop = 0;
+    e.resolution = (uint8_t)resolution;
+    e.frequency = frequency;
+    e.duty = duty;
+    writeQueue.push_back(e);
+    return JS_NewPromiseCapability(ctx, writeQueue.back().resolving_funcs);
+  }
+
+  JSValue js_writeAnalogStop(JSContext* ctx, int argc, JSValueConst* argv) {
+    uint32_t pin;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    WriteEntry e;
+    e.pin = (uint8_t)pin;
+    e.is_stop = 1;
+    writeQueue.push_back(e);
+    return JS_NewPromiseCapability(ctx, writeQueue.back().resolving_funcs);
+  }
+
+  // touch(pin, threshold, callback) → dispose()
+  // Returns a JS function that, when called, removes the listener.
+  JSValue js_touch(JSContext* ctx, int argc, JSValueConst* argv) {
+    uint32_t pin, threshold = 0;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    if (argc >= 2) JS_ToUint32(ctx, &threshold, argv[1]);
+    if (!JS_IsFunction(ctx, argv[2])) {
+      return JS_ThrowTypeError(ctx, "touch: callback must be a function");
+    }
+    int id = addTouch(ctx, (uint8_t)pin, (uint16_t)threshold, argv[2]);
+    if (id == 0) {
+      return JS_ThrowInternalError(ctx, "touch: no free listener slot");
+    }
+    // Build the dispose function via JS_NewCFunctionData, capturing
+    // the slot id in the function's `magic` integer slot. QuickJS
+    // gives dispose() calls the magic value as the 5th arg; the
+    // 6th is the func_data pointer (we pass nullptr so it's
+    // always null here). The lambda is non-capturing so it
+    // converts to a plain C function pointer; we look up the
+    // JSAnalog via the static `instance` pointer instead of going
+    // through the (still-incomplete here) ESP32QuickJS forward
+    // declaration.
+    auto trampoline = [](JSContext* ctx2, JSValueConst jsThis2, int argc2,
+                         JSValueConst* argv2, int magic,
+                         JSValueConst* func_data) -> JSValue {
+      (void)jsThis2; (void)argc2; (void)argv2; (void)func_data;
+      if (JSAnalog::instance) {
+        JSAnalog::instance->removeTouch(ctx2, magic);
+      }
+      return JS_UNDEFINED;
+    };
+    return JS_NewCFunctionData(ctx, trampoline, 0, id, 0, nullptr);
+  }
+};
+
+// Static instance pointer for ISR → listener lookup.
+JSAnalog* JSAnalog::instance = nullptr;
 
 #ifdef ENABLE_FS
 // Generic Promise-style filesystem backend. Works with any Arduino FS (LittleFS, SD, ...).
@@ -1025,6 +1425,9 @@ class ESP32QuickJS {
   JSContext *ctx;
   JSTimer timer;
   JSValue loop_func = JS_UNDEFINED;
+  // Analog I/O and touch listeners. Always available (no feature
+  // flag — uses on-chip ADC / LEDC / touch hardware).
+  JSAnalog analog;
 #ifdef ENABLE_WIFI
   JSHttpFetcher httpFetcher;
   JSWebServer webServer;
@@ -1055,6 +1458,7 @@ class ESP32QuickJS {
     JSValue global = JS_GetGlobalObject(ctx);
     setup(ctx, global);
     JS_FreeValue(ctx, global);
+    analog.init();
 #ifdef ENABLE_ESPNOW
     // Wire the static trampoline so C callbacks can find this instance.
     JSEspNow::instance = &espNow;
@@ -1064,6 +1468,7 @@ class ESP32QuickJS {
 
   void end() {
     timer.RemoveAll(ctx);
+    analog.end(ctx);
 #ifdef ENABLE_ESPNOW
     if (espNow.isInitialized()) espNow.end();
     espNow.clearHandlers();
@@ -1086,6 +1491,9 @@ class ESP32QuickJS {
     if (timer.GetNextTimeout(now) >= 0) {
       timer.ConsumeTimer(ctx, now);
     }
+
+    // Analog I/O + touch listeners (always available, no flag)
+    analog.loop(ctx);
 
 #ifdef ENABLE_WIFI
     httpFetcher.loop(ctx);
@@ -1126,6 +1534,34 @@ class ESP32QuickJS {
       // so the exception message goes to the originating REPL
       // (Serial REPL or specific telnet client) instead of always
       // to Serial.
+      qjs_dump_exception(ctx, ret);
+    }
+    return ret;
+  }
+
+  // Async-eval: wraps the user code in an async IIFE so that
+  // top-level `await` works. The returned value is a Promise; the
+  // caller can chain .then() if they want a result. Used by the
+  // REPL to support `await esp32.readAnalog(34)` directly.
+  //
+  // Note: this costs one extra function-call frame and forces the
+  // code to run as `script` inside the async body. Top-level `let`
+  // and `const` are function-scoped, not block-scoped, so they
+  // don't leak to subsequent evals — same as the JS spec.
+  JSValue evalAsync(const char *code) {
+    // Wrap: "(async()=>{ <code> })()"
+    size_t n = strlen(code);
+    // Prefix + suffix + NUL
+    const char* prefix = "(async()=>{\n";
+    const char* suffix = "\n})()";
+    size_t total = strlen(prefix) + n + strlen(suffix) + 1;
+    char* wrapped = (char*)js_malloc(ctx, total);
+    if (!wrapped) return JS_EXCEPTION;
+    snprintf(wrapped, total, "%s%s%s", prefix, code, suffix);
+    JSValue ret = JS_Eval(ctx, wrapped, total - 1, "<eval-async>",
+                          JS_EVAL_TYPE_GLOBAL);
+    js_free(ctx, wrapped);
+    if (JS_IsException(ret)) {
       qjs_dump_exception(ctx, ret);
     }
     return ret;
@@ -1315,6 +1751,25 @@ class ESP32QuickJS {
             "digitalWrite", 0, JS_DEF_CFUNC, 0, {
               func : {2, JS_CFUNC_generic, esp32_gpio_digital_write}
             }},
+        JSCFunctionListEntry{"readAnalog", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, esp32_read_analog}
+                             }},
+        JSCFunctionListEntry{"writeAnalog", 0, JS_DEF_CFUNC, 0, {
+                               func : {4, JS_CFUNC_generic, esp32_write_analog}
+                             }},
+        JSCFunctionListEntry{
+            "writeAnalogStop", 0, JS_DEF_CFUNC, 0, {
+              func : {1, JS_CFUNC_generic, esp32_write_analog_stop}
+            }},
+        JSCFunctionListEntry{"touch", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, esp32_touch}
+                             }},
+        JSCFunctionListEntry{"analogRead", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, esp32_analog_read}
+                             }},
+        JSCFunctionListEntry{"analogWrite", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, esp32_analog_write}
+                             }},
         JSCFunctionListEntry{"deepSleep", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_deep_sleep}
                              }},
@@ -1435,6 +1890,68 @@ class ESP32QuickJS {
     JS_ToUint32(ctx, &value, argv[1]);
     digitalWrite(pin, value);
     return JS_UNDEFINED;
+  }
+
+  // --- Analog I/O + touch. Trampolines pull qjs out of the context
+  // opaque pointer and delegate to the JSAnalog member. ---
+  static JSValue esp32_read_analog(JSContext *ctx, JSValueConst jsThis,
+                                   int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    return qjs->analog.js_readAnalog(ctx, argc, argv);
+  }
+
+  static JSValue esp32_write_analog(JSContext *ctx, JSValueConst jsThis,
+                                    int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    return qjs->analog.js_writeAnalog(ctx, argc, argv);
+  }
+
+  static JSValue esp32_write_analog_stop(JSContext *ctx, JSValueConst jsThis,
+                                         int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    return qjs->analog.js_writeAnalogStop(ctx, argc, argv);
+  }
+
+  static JSValue esp32_touch(JSContext *ctx, JSValueConst jsThis, int argc,
+                             JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    return qjs->analog.js_touch(ctx, argc, argv);
+  }
+
+  // analogRead(pin) — Arduino-style alias for readAnalog(pin, 12).
+  // Returns a Promise<number> (the ADC reading).
+  static JSValue esp32_analog_read(JSContext *ctx, JSValueConst jsThis,
+                                   int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    return qjs->analog.js_readAnalog(ctx, argc, argv);
+  }
+
+  // analogWrite(pin, fraction, [freq=5000])
+  // Arduino-style API: fraction is 0.0..1.0. Internally maps to 8-bit
+  // duty and forwards to writeAnalog. Returns the same Promise<{channel}>.
+  static JSValue esp32_analog_write(JSContext *ctx, JSValueConst jsThis,
+                                    int argc, JSValueConst *argv) {
+    if (argc < 2) {
+      return JS_ThrowTypeError(ctx, "analogWrite: need (pin, fraction, [freq])");
+    }
+    double frac = 0;
+    JS_ToFloat64(ctx, &frac, argv[1]);
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
+    uint32_t duty = (uint32_t)(frac * 255.0 + 0.5);
+    uint32_t freq = (argc >= 3) ? 0 : 5000;
+    if (argc >= 3) JS_ToUint32(ctx, &freq, argv[2]);
+    // Build argv for js_writeAnalog: (pin, duty, freq, resolution)
+    JSValue wargv[4] = {
+      JS_DupValue(ctx, argv[0]),
+      JS_NewUint32(ctx, duty),
+      JS_NewUint32(ctx, freq),
+      JS_NewUint32(ctx, 8),
+    };
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
+    return ret;
   }
 
   static JSValue esp32_deep_sleep(JSContext *ctx, JSValueConst jsThis, int argc,
