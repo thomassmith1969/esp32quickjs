@@ -93,8 +93,6 @@ static void qjs_dump_exception(JSContext *ctx, JSValue v) {
   // Route to activeOutputStream if a REPL is active; otherwise Serial.
   // Note: this POPS the exception from the pending slot, so the caller
   // must not also call JS_GetException.
-  Serial.printf("[dump_exc] activeOut=%p Serial=%p\n",
-                (void*)activeOutputStream, (void*)&Serial);
   qjs_dump_exception_to(ctx, v, activeOutputStream ? (Print*)activeOutputStream : nullptr);
 }
 
@@ -1352,8 +1350,6 @@ class ESP32QuickJS {
     // Route output to the REPL that initiated this command (Serial or a
     // specific telnet client). Falls back to Serial if no REPL is active.
     Stream* out = activeOutputStream ? activeOutputStream : (Stream*)&Serial;
-    Serial.printf("[console_log] activeOut=%p Serial=%p argc=%d\n",
-                  (void*)activeOutputStream, (void*)&Serial, argc);
     for (int i = 0; i < argc; i++) {
       const char *str = JS_ToCString(ctx, argv[i]);
       if (str) {
