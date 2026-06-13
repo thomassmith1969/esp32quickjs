@@ -2683,6 +2683,8 @@ class ESP32QuickJS {
   JSContext *ctx;
   JSTimer timer;
   JSValue loop_func = JS_UNDEFINED;
+  // Module cache: maps module name -> filesystem path
+  std::map<std::string, std::string> module_cache;
   // Analog I/O and touch listeners. Always available (no feature
   // flag — uses on-chip ADC / LEDC / touch hardware).
   JSAnalog analog;
@@ -2717,6 +2719,8 @@ class ESP32QuickJS {
   void begin(JSRuntime *rt, JSContext *ctx, int memoryLimit = 0) {
     this->rt = rt;
     this->ctx = ctx;
+    this->module_cache.clear();
+    
     if (memoryLimit == 0) {
       // Give QuickJS most of free heap. The old `>> 1` was overly
       // conservative and caused OOMs on moderately-sized uploads/scripts.
@@ -2882,6 +2886,49 @@ class ESP32QuickJS {
     JS_FreeValue(ctx, global);
   }
 
+  // requireModule(name): load and return a module from the filesystem.
+  // The module must export a function named `moduleInit` that returns
+  // the module namespace object. This is used for dynamic imports like:
+  //   const mod = await import('/path/to/module.js')
+  //   const ns = mod.default
+  JSValue requireModule(const char *module_name) {
+    // Look for module in cache
+    std::string module_path = module_cache[module_name];
+    if (module_path.empty()) {
+      return JS_ThrowReferenceError(ctx, "Module not found: %s", module_name);
+    }
+    // Load module code from file using C-style read
+    FILE* f = fopen(module_path.c_str(), "r");
+    if (!f) {
+      return JS_ThrowReferenceError(ctx, "Failed to read module: %s", module_path.c_str());
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* code = (char*)js_malloc(ctx, fsize + 1);
+    if (!code) {
+      fclose(f);
+      return JS_ThrowOutOfMemory(ctx);
+    }
+    size_t nread = fread(code, 1, fsize, f);
+    code[nread] = '\0';
+    fclose(f);
+    // Execute module code to get module namespace
+    JSValue module_ns = eval(code);
+    js_free(ctx, code);
+    if (JS_IsException(module_ns)) {
+      return module_ns;
+    }
+    // Return the module namespace (the result of moduleInit())
+    return module_ns;
+  }
+
+  // registerModule(name, path): register a module by name and filesystem path.
+  // This is used by the module loader to map module names to file paths.
+  void registerModule(const char *name, const char *path) {
+    module_cache[name] = path;
+  }
+
  protected:
   void setLoopFunc(JSValue f) {
     JS_FreeValue(ctx, loop_func);
@@ -2891,6 +2938,45 @@ class ESP32QuickJS {
   virtual void setup(JSContext *ctx, JSValue global) {
     this->ctx = ctx;
     JS_SetContextOpaque(ctx, this);
+
+    // Module loader for filesystem-based module loading
+    // This function is called by QuickJS when a module is requested via import
+    // Format: "filename:module_init_code" where module_init_code is a function
+    // that exports the module's public API
+    JS_SetModuleLoaderFunc(
+        qjs->rt,
+        [](JSContext *ctx, const char *module_name, void *opaque) {
+            ESP32QuickJS* qjs = (ESP32QuickJS*)opaque;
+            // Look for module in qjs->module_cache
+            std::string module_path = qjs->module_cache[module_name];
+            if (module_path.empty()) {
+                return nullptr;
+            }
+            // Load module code from file using C-style read
+            FILE* f = fopen(module_path.c_str(), "r");
+            if (!f) {
+                return nullptr;
+            }
+            fseek(f, 0, SEEK_END);
+            long fsize = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char* code = (char*)js_malloc(ctx, fsize + 1);
+            if (!code) {
+                fclose(f);
+                return nullptr;
+            }
+            size_t nread = fread(code, 1, fsize, f);
+            code[nread] = '\0';
+            fclose(f);
+            // Execute module code to get module namespace
+            JSValue module_ns = qjs->eval(code);
+            js_free(ctx, code);
+            if (JS_IsException(module_ns)) {
+                return nullptr;
+            }
+            return JS_GetPropertyStr(ctx, module_ns, "__esModule");
+        },
+        qjs, nullptr);
 
     // setup console.log()
     JSValue console = JS_NewObject(ctx);
