@@ -2728,13 +2728,7 @@ class ESP32QuickJS {
     this->module_cache.clear();
     
     if (memoryLimit == 0) {
-      // Give QuickJS most of free heap. The old `>> 1` was overly
-      // conservative and caused OOMs on moderately-sized uploads/scripts.
-      // We leave ~32KB for the rest of the firmware (WiFi buffers, LittleFS
-      // cache, etc.) which is plenty for steady-state operation; the rest
-      // (often 200+ KB) is fair game for the JS heap. QuickJS allocates
-      // lazily and returns memory to the pool under JS_SetGCThreshold, so
-      // a high ceiling does not waste RAM when scripts are not running.
+      // Give QuickJS most of free heap, leaving room for C++ std::string/map.
       uint32_t free = ESP.getFreeHeap();
       uint32_t reserve = 32 * 1024;
       memoryLimit = (free > reserve) ? (int)(free - reserve) : (int)free;
