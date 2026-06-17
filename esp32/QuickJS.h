@@ -41,9 +41,15 @@ extern Stream* activeOutputStream;
 extern int currentTelnetId;
 
 #include <queue>
+#include <map>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+
+// FreeRTOS headers for the non-blocking module loader task.
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 #ifdef ENABLE_WIFI
 #include <HTTPClient.h>
@@ -2739,6 +2745,8 @@ class ESP32QuickJS {
     JSValue global = JS_GetGlobalObject(ctx);
     setup(ctx, global);
     JS_FreeValue(ctx, global);
+    // Initialize the non-blocking module loader (spawns FreeRTOS reader task).
+    module_loader.init(ctx);
     analog.init();
 #ifdef ENABLE_I2C
     JSI2C::instance = &i2c;
@@ -2778,6 +2786,8 @@ class ESP32QuickJS {
     espNow.clearHandlers();
     JSEspNow::instance = nullptr;
 #endif
+    // Stop the module loader background task and free cached modules.
+    module_loader.end();
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
   }
@@ -2789,6 +2799,10 @@ class ESP32QuickJS {
     if (ret < 0) {
       qjs_dump_exception(ctx, JS_UNDEFINED);
     }
+
+    // Process queued module loads (non-blocking — resolves Promises
+    // for async require()/import() and makes static imports available).
+    module_loader.loop(ctx);
 
     // timer
     uint32_t now = millis();
@@ -2886,47 +2900,594 @@ class ESP32QuickJS {
     JS_FreeValue(ctx, global);
   }
 
-  // requireModule(name): load and return a module from the filesystem.
-  // The module must export a function named `moduleInit` that returns
-  // the module namespace object. This is used for dynamic imports like:
-  //   const mod = await import('/path/to/module.js')
-  //   const ns = mod.default
-  JSValue requireModule(const char *module_name) {
-    // Look for module in cache
-    std::string module_path = module_cache[module_name];
-    if (module_path.empty()) {
-      return JS_ThrowReferenceError(ctx, "Module not found: %s", module_name);
+  // ---- Non-blocking module loader ----
+  //
+  // JS module loading has two faces:
+  //
+  //   1. Static `import` statements:  `import { fib } from "./fib.js"`
+  //      QuickJS resolves these at eval time by calling the
+  //      JS_SetModuleLoaderFunc callback, which MUST return a
+  //      JSModuleDef* synchronously. We compile the already-loaded
+  //      source (pre-read by the FreeRTOS reader task).
+  //
+  //   2. Dynamic `require()`:
+  //      Synchronous — blocks the calling JS code and returns the module
+  //      namespace directly (NOT a Promise), exactly like Node.js.
+  //      While waiting for the background file read, it pumps
+  //      ESP32QuickJS::loop() so timers/WiFi/I2C keep running.
+  //      The file I/O happens on a FreeRTOS task — the JS thread never
+  //      does blocking I/O.
+  //        const fib = require("./fib.js")   // blocks, returns module
+  //
+  //   3. Dynamic `importModule()`:
+  //      Returns a Promise (ES dynamic import semantics).
+  //        const { fib } = await importModule("./fib.js")
+  //
+  // All paths share the same background reader task and source cache.
+  //
+  // ---- The "fake blocking" pattern ----
+  //
+  // JSBlockingGuard is a reusable utility that lets any C++ code block
+  // the JS thread while keeping the event loop alive. It pumps
+  // ESP32QuickJS::loop() (timers, WiFi, I2C, pending jobs, etc.) on each
+  // iteration, then yields with vTaskDelay so the FreeRTOS reader task
+  // on core 0 gets CPU time to do the actual blocking I/O.
+  //
+  // Usage from any method that needs to wait for a background operation:
+  //
+  //   JSBlockingGuard guard(ctx, qjs, 5000);  // 5s timeout
+  //   while (!myConditionMet()) {
+  //     if (guard.tick()) {
+  //       return JS_ThrowReferenceError(ctx, "timeout");
+  //     }
+  //   }
+  //
+  // guard.tick() returns true on timeout, false to keep waiting.
+  // Each tick pumps the full event loop and yields ~1ms to other tasks.
+  //
+  class JSBlockingGuard {
+  public:
+    JSContext *ctx_;
+    ESP32QuickJS *qjs_;
+    uint32_t start_ms_;
+    uint32_t timeout_ms_;
+
+    JSBlockingGuard(JSContext *ctx, ESP32QuickJS *qjs, uint32_t timeout_ms = 5000)
+      : ctx_(ctx), qjs_(qjs), start_ms_(millis()), timeout_ms_(timeout_ms) {}
+
+    // Pump the event loop once and check timeout.
+    // Returns true if timed out, false to keep waiting.
+    bool tick() {
+      // Pump QuickJS pending jobs (Promise callbacks, async/await).
+      JSContext *c;
+      int ret = JS_ExecutePendingJob(JS_GetRuntime(ctx_), &c);
+      if (ret < 0) {
+        qjs_dump_exception(ctx_, JS_UNDEFINED);
+      }
+
+      // Pump the full ESP32QuickJS::loop() so all subsystems keep running.
+      // callLoopFn=false to avoid re-entering the user's JS loop() callback
+      // (which could cause re-entrancy issues).
+      qjs_->loop(false);
+
+      // Yield to let the FreeRTOS reader task (core 0) do the actual I/O.
+      vTaskDelay(pdMS_TO_TICKS(1));
+
+      return (millis() - start_ms_) > timeout_ms_;
     }
-    // Load module code from file using C-style read
-    FILE* f = fopen(module_path.c_str(), "r");
-    if (!f) {
-      return JS_ThrowReferenceError(ctx, "Failed to read module: %s", module_path.c_str());
+
+    // Convenience: wait until condition() returns true, or timeout.
+    // condition is any callable that returns bool.
+    template<typename Cond>
+    bool wait(Cond &&condition) {
+      while (!condition()) {
+        if (tick()) return false;  // timed out
+      }
+      return true;  // condition met
     }
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* code = (char*)js_malloc(ctx, fsize + 1);
-    if (!code) {
-      fclose(f);
-      return JS_ThrowOutOfMemory(ctx);
+  };
+
+  class JSModuleLoader {
+  public:
+    // A pending or completed file-read request.
+    struct LoadRequest {
+      std::string module_name;   // logical name (e.g. "./fib.js")
+      std::string file_path;      // filesystem path
+      // Result of the background read:
+      std::string source;
+      bool loaded = false;
+      bool error = false;
+      std::string error_msg;
+      // For async require()/import() — the Promise to resolve:
+      JSValue resolving_funcs[2];  // [resolve, reject]
+      bool has_promise = false;
+      // For static import — a flag the loader callback polls:
+      bool is_static = false;
+    };
+
+  private:
+    // Pending requests waiting to be read by the background task.
+    std::vector<LoadRequest*> pending_;
+    // Completed reads keyed by module_name — source code cache.
+    std::map<std::string, LoadRequest*> cache_;
+    // Resolved module namespaces keyed by module_name (for require()).
+    std::map<std::string, JSValue> ns_cache_;
+
+    // FreeRTOS task handle for the background file reader.
+    TaskHandle_t reader_task_ = nullptr;
+    // Semaphore protecting pending_/cache_ across the task boundary.
+    SemaphoreHandle_t mutex_ = nullptr;
+    // Notification semaphore: signals the reader task that work is available.
+    SemaphoreHandle_t notify_ = nullptr;
+    // Flag to tell the reader task to exit.
+    bool stopping_ = false;
+
+    JSContext *ctx_ = nullptr;
+
+    // Static FreeRTOS task entry point.
+    static void readerTaskEntry(void *arg) {
+      auto *self = static_cast<JSModuleLoader*>(arg);
+      self->readerTask();
+      vTaskDelete(nullptr);
     }
-    size_t nread = fread(code, 1, fsize, f);
-    code[nread] = '\0';
-    fclose(f);
-    // Execute module code to get module namespace
-    JSValue module_ns = eval(code);
-    js_free(ctx, code);
-    if (JS_IsException(module_ns)) {
-      return module_ns;
+
+    // Background task: waits for notifications, reads files from flash,
+    // stores results. This is the ONLY place that does blocking file I/O
+    // — it runs on a separate core/task so the main loop never blocks.
+    void readerTask() {
+      while (true) {
+        // Wait for work.
+        xSemaphoreTake(notify_, portMAX_DELAY);
+        if (stopping_) break;
+
+        // Grab pending requests under the mutex.
+        std::vector<LoadRequest*> work;
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        work.swap(pending_);
+        xSemaphoreGive(mutex_);
+
+        for (auto *req : work) {
+          // Read the file using the Arduino File API (LittleFS/SD).
+          // This is the blocking part, but we're on a separate task so
+          // the JS engine never stalls.
+#ifdef ENABLE_FS
+          // Ensure LittleFS is mounted before trying to read.
+          if (!LittleFS.begin(false)) {
+            req->error = true;
+            req->error_msg = "LittleFS mount failed";
+          } else if (LittleFS.exists(req->file_path.c_str())) {
+            File f = LittleFS.open(req->file_path.c_str(), "r");
+            if (!f) {
+              req->error = true;
+              req->error_msg = "EOPEN: " + req->file_path;
+            } else {
+              std::string buf;
+              const size_t CHUNK = 512;
+              uint8_t chunk[CHUNK];
+              while (f.available()) {
+                size_t n = f.read(chunk, CHUNK);
+                if (!n) break;
+                buf.append((const char *)chunk, n);
+              }
+              f.close();
+              req->source = std::move(buf);
+              req->loaded = true;
+            }
+          } else {
+            req->error = true;
+            req->error_msg = "ENOENT: " + req->file_path;
+          }
+#else
+          req->error = true;
+          req->error_msg = "filesystem not enabled (ENABLE_FS)";
+#endif
+
+          // Store in cache under the mutex.
+          xSemaphoreTake(mutex_, portMAX_DELAY);
+          cache_[req->module_name] = req;
+          xSemaphoreGive(mutex_);
+        }
+      }
     }
-    // Return the module namespace (the result of moduleInit())
-    return module_ns;
-  }
+
+  public:
+    void init(JSContext *ctx) {
+      ctx_ = ctx;
+      mutex_ = xSemaphoreCreateMutex();
+      notify_ = xSemaphoreCreateBinary();
+      // Create the reader task on core 0 (Arduino loop runs on core 1).
+      // Stack 4096 is enough for fopen/fread; priority 1 = low.
+      xTaskCreatePinnedToCore(readerTaskEntry, "js_modload",
+                               4096, this, 1, &reader_task_, 0);
+    }
+
+    void end() {
+      stopping_ = true;
+      if (notify_) xSemaphoreGive(notify_);
+      // Give the task a moment to exit.
+      vTaskDelay(pdMS_TO_TICKS(50));
+      if (reader_task_) {
+        vTaskDelete(reader_task_);
+        reader_task_ = nullptr;
+      }
+      if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
+      if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
+      // Free cached namespaces.
+      for (auto &kv : ns_cache_) {
+        if (ctx_) JS_FreeValue(ctx_, kv.second);
+      }
+      ns_cache_.clear();
+      for (auto &kv : cache_) delete kv.second;
+      cache_.clear();
+    }
+
+    // ---- Static import path ----
+    // Called by JS_SetModuleLoaderFunc callback. Returns a JSModuleDef*
+    // by compiling the already-loaded source. If the source isn't loaded
+    // yet, kicks off a background read and returns nullptr (QuickJS will
+    // throw a ReferenceError; the module can be re-imported once loaded).
+    // In practice, modules are pre-registered via registerModule() which
+    // kicks off the read immediately, so by the time JS code runs the
+    // source is usually already in cache_.
+    JSModuleDef *loadStatic(JSContext *ctx, const char *module_name) {
+      // Check cache.
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      auto it = cache_.find(module_name);
+      bool has = (it != cache_.end()) && it->second->loaded;
+      LoadRequest *req = has ? it->second : nullptr;
+      xSemaphoreGive(mutex_);
+
+      if (!has || !req) {
+        // Not loaded yet — see if we have a registered path for it.
+        // The module_cache map (in ESP32QuickJS) holds name→path.
+        // We can't access it from here directly, so the loader callback
+        // in setup() handles the path lookup and calls queueRead().
+        return nullptr;
+      }
+
+      // Compile the source as a module (CPU-only, no I/O).
+      JSValue func_val = JS_Eval(ctx, req->source.c_str(),
+                                 req->source.size(), module_name,
+                                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+      if (JS_IsException(func_val)) {
+        JS_FreeValue(ctx, func_val);
+        return nullptr;
+      }
+      // The JSValue IS the module def pointer.
+      JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+      // JS_Eval with COMPILE_ONLY returns a referenced value; the module
+      // is already referenced internally by QuickJS, so we free our ref.
+      JS_FreeValue(ctx, func_val);
+      return m;
+    }
+
+    // ---- Synchronous require() path ----
+    // Blocks the JS thread until the module is loaded, but pumps
+    // ESP32QuickJS::loop() while waiting so timers/WiFi/I2C keep running.
+    // The file read happens on the FreeRTOS reader task — the JS thread
+    // never does blocking I/O. Returns the module namespace directly
+    // (NOT a Promise), exactly like Node.js require().
+    JSValue requireSync(JSContext *ctx, ESP32QuickJS *qjs,
+                        const char *module_name, const char *file_path) {
+      // Check namespace cache first — already loaded module.
+      auto nsit = ns_cache_.find(module_name);
+      if (nsit != ns_cache_.end()) {
+        return JS_DupValue(ctx, nsit->second);
+      }
+
+      // Check if source is already loaded in cache_.
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      auto sit = cache_.find(module_name);
+      bool src_ready = (sit != cache_.end()) && sit->second->loaded;
+      xSemaphoreGive(mutex_);
+
+      if (!src_ready) {
+        // Kick off a background read if not already pending.
+        queueRead(module_name, file_path);
+
+        // Block the JS thread while pumping the event loop.
+        // JSBlockingGuard keeps timers, WiFi, I2C, pending jobs, etc.
+        // all running. The FreeRTOS reader task does the actual file I/O.
+        JSBlockingGuard guard(ctx, qjs, 5000);
+        if (!guard.wait([&]() { return isLoaded(module_name); })) {
+          return JS_ThrowReferenceError(ctx,
+            "require: timeout loading module '%s' from '%s'",
+            module_name, file_path);
+        }
+      }
+
+      // Source is now loaded — evaluate as module on the JS thread.
+      std::string src = getSource(module_name);
+      if (src.empty()) {
+        return JS_ThrowReferenceError(ctx,
+          "require: empty source for module '%s'", module_name);
+      }
+
+      JSValue ns = evalModuleAndGetNS(ctx, src, module_name);
+      if (JS_IsException(ns)) {
+        return JS_EXCEPTION;
+      }
+
+      // Cache the namespace for future require() calls.
+      ns_cache_[module_name] = JS_DupValue(ctx, ns);
+      return ns;  // Return the namespace directly (not a Promise).
+    }
+
+    // ---- Async require()/import() path ----
+    // Queue a read and return a Promise. Resolved in loop().
+    JSValue queueAsyncLoad(JSContext *ctx, const char *module_name,
+                           const char *file_path) {
+      // Check if we already have the namespace cached.
+      auto nsit = ns_cache_.find(module_name);
+      if (nsit != ns_cache_.end()) {
+        // Already loaded — resolve immediately.
+        JSValue resolving_funcs[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+        JSValue ns = JS_DupValue(ctx, nsit->second);
+        JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &ns);
+        JS_FreeValue(ctx, ns);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        return promise;
+      }
+
+      // Check if source is already loaded in cache_.
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      auto sit = cache_.find(module_name);
+      if (sit != cache_.end() && sit->second->loaded) {
+        // Source is ready — we can evaluate right now in loop().
+        xSemaphoreGive(mutex_);
+        // Create a request that loop() will process (evaluate + resolve).
+        LoadRequest *req = new LoadRequest();
+        req->module_name = module_name;
+        req->file_path = file_path;
+        req->source = sit->second->source;
+        req->loaded = true;
+        JSValue promise = JS_NewPromiseCapability(ctx, req->resolving_funcs);
+        req->has_promise = true;
+        // Queue for loop() processing (not for the reader task).
+        pending_eval_.push_back(req);
+        return promise;
+      }
+      xSemaphoreGive(mutex_);
+
+      // Need to read the file — create a request and queue it.
+      LoadRequest *req = new LoadRequest();
+      req->module_name = module_name;
+      req->file_path = file_path;
+      JSValue promise = JS_NewPromiseCapability(ctx, req->resolving_funcs);
+      req->has_promise = true;
+
+      // Queue for the background reader task.
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      pending_.push_back(req);
+      xSemaphoreGive(mutex_);
+      // Wake the reader task.
+      xSemaphoreGive(notify_);
+
+      return promise;
+    }
+
+    // Queue a read without a Promise (for pre-loading / static import).
+    void queueRead(const char *module_name, const char *file_path) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      // Don't double-queue if already cached or pending.
+      if (cache_.find(module_name) != cache_.end()) {
+        xSemaphoreGive(mutex_);
+        return;
+      }
+      for (auto *p : pending_) {
+        if (p->module_name == module_name) {
+          xSemaphoreGive(mutex_);
+          return;
+        }
+      }
+      xSemaphoreGive(mutex_);
+
+      LoadRequest *req = new LoadRequest();
+      req->module_name = module_name;
+      req->file_path = file_path;
+      req->is_static = true;
+
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      pending_.push_back(req);
+      xSemaphoreGive(mutex_);
+      xSemaphoreGive(notify_);
+    }
+
+    // Check if a module's source has been loaded (for static import).
+    bool isLoaded(const char *module_name) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      auto it = cache_.find(module_name);
+      bool has = (it != cache_.end()) && it->second->loaded;
+      xSemaphoreGive(mutex_);
+      return has;
+    }
+
+    // Get cached source (for static import compilation).
+    std::string getSource(const char *module_name) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      auto it = cache_.find(module_name);
+      std::string src = (it != cache_.end()) ? it->second->source : "";
+      xSemaphoreGive(mutex_);
+      return src;
+    }
+
+  private:
+    // Requests whose source is loaded and need evaluation + promise resolution.
+    // Processed in loop() on the JS thread (QuickJS is not thread-safe).
+    std::vector<LoadRequest*> pending_eval_;
+
+    // Compile + evaluate a module from source, return its namespace.
+    // Returns JS_EXCEPTION on error.
+    //
+    // We use JS_Eval with JS_EVAL_TYPE_MODULE to compile and evaluate
+    // the module. Then we access the module_ns field from the
+    // JSModuleDef struct. The struct is opaque in the public API, so
+    // we replicate the layout to access module_ns. If module_ns is
+    // still JS_UNDEFINED (not yet built), we trigger the build by
+    // evaluating a wrapper import that forces js_get_module_ns() to
+    // run, which populates the field.
+    static JSValue evalModuleAndGetNS(JSContext *ctx, const std::string &src,
+                                      const char *module_name) {
+      // Step 1: Compile and evaluate the module.
+      JSValue func_val = JS_Eval(ctx, src.c_str(), src.size(), module_name,
+                                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+      if (JS_IsException(func_val)) {
+        JS_FreeValue(ctx, func_val);
+        return JS_EXCEPTION;
+      }
+
+      // Get the JSModuleDef pointer.
+      JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+
+      // Evaluate the module (resolves imports, runs module code).
+      // JS_EvalFunction consumes func_val.
+      JSValue eval_ret = JS_EvalFunction(ctx, func_val);
+      if (JS_IsException(eval_ret)) {
+        JS_FreeValue(ctx, eval_ret);
+        return JS_EXCEPTION;
+      }
+      JS_FreeValue(ctx, eval_ret);
+
+      // Step 2: Trigger namespace creation by evaluating a wrapper
+      // import. This forces js_get_module_ns() to run, which builds
+      // and caches the namespace in m->module_ns.
+      std::string wrapper = std::string("import * as __ns from \"") +
+                            module_name + "\"";
+      JSValue wrap_ret = JS_Eval(ctx, wrapper.c_str(), wrapper.size(),
+                                 "<ns-trigger>", JS_EVAL_TYPE_MODULE);
+      if (JS_IsException(wrap_ret)) {
+        JS_FreeValue(ctx, wrap_ret);
+        return JS_EXCEPTION;
+      }
+      JS_FreeValue(ctx, wrap_ret);
+
+      // Step 3: Now access module_ns from the JSModuleDef struct.
+      // The namespace was built by the wrapper import above.
+      // We replicate the struct layout to access the module_ns field.
+      struct JSModuleDefLayout {
+        JSRefCountHeader header;
+        JSAtom module_name;
+        void *link[2];  // struct list_head (prev, next)
+        void *req_module_entries;
+        int req_module_entries_count;
+        int req_module_entries_size;
+        void *export_entries;
+        int export_entries_count;
+        int export_entries_size;
+        void *star_export_entries;
+        int star_export_entries_count;
+        int star_export_entries_size;
+        void *import_entries;
+        int import_entries_count;
+        int import_entries_size;
+        JSValue module_ns;
+      };
+      auto *mod = reinterpret_cast<JSModuleDefLayout*>(m);
+      if (JS_IsUndefined(mod->module_ns)) {
+        return JS_ThrowInternalError(ctx,
+          "require: module namespace not built for '%s'", module_name);
+      }
+      return JS_DupValue(ctx, mod->module_ns);
+    }
+
+  public:
+    // Called from ESP32QuickJS::loop() on the JS thread.
+    // Evaluates loaded modules and resolves/rejects their Promises.
+    void loop(JSContext *ctx) {
+      // Check if any pending reads have completed (for async require/import).
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      std::vector<LoadRequest*> ready;
+      // Pull completed requests that have promises.
+      for (auto it = pending_.begin(); it != pending_.end(); ) {
+        LoadRequest *req = *it;
+        if (req->loaded || req->error) {
+          // Move to ready list for JS-thread processing.
+          ready.push_back(req);
+          it = pending_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      xSemaphoreGive(mutex_);
+
+      // Process ready requests on the JS thread.
+      for (auto *req : ready) {
+        if (req->error) {
+          if (req->has_promise) {
+            JSValue err = JS_NewString(ctx, req->error_msg.c_str());
+            JS_Call(ctx, req->resolving_funcs[1], JS_UNDEFINED, 1, &err);
+            JS_FreeValue(ctx, err);
+            JS_FreeValue(ctx, req->resolving_funcs[0]);
+            JS_FreeValue(ctx, req->resolving_funcs[1]);
+          }
+          delete req;
+          continue;
+        }
+
+        // Source is loaded — evaluate as module and get namespace.
+        JSValue ns = evalModuleAndGetNS(ctx, req->source, req->module_name.c_str());
+
+        if (JS_IsException(ns)) {
+          if (req->has_promise) {
+            JSValue exc = JS_GetException(ctx);
+            JS_Call(ctx, req->resolving_funcs[1], JS_UNDEFINED, 1, &exc);
+            JS_FreeValue(ctx, exc);
+            JS_FreeValue(ctx, req->resolving_funcs[0]);
+            JS_FreeValue(ctx, req->resolving_funcs[1]);
+          }
+          JS_FreeValue(ctx, ns);
+          delete req;
+          continue;
+        }
+
+        // Cache the namespace for future require() calls.
+        ns_cache_[req->module_name] = JS_DupValue(ctx, ns);
+
+        // Resolve the promise (if we have one).
+        if (req->has_promise) {
+          JS_Call(ctx, req->resolving_funcs[0], JS_UNDEFINED, 1, &ns);
+          JS_FreeValue(ctx, req->resolving_funcs[0]);
+          JS_FreeValue(ctx, req->resolving_funcs[1]);
+        }
+        JS_FreeValue(ctx, ns);
+        delete req;
+      }
+
+      // Also process any pending_eval_ requests (source already loaded).
+      for (auto *req : pending_eval_) {
+        JSValue ns = evalModuleAndGetNS(ctx, req->source, req->module_name.c_str());
+        if (JS_IsException(ns)) {
+          JSValue exc = JS_GetException(ctx);
+          JS_Call(ctx, req->resolving_funcs[1], JS_UNDEFINED, 1, &exc);
+          JS_FreeValue(ctx, exc);
+          JS_FreeValue(ctx, req->resolving_funcs[0]);
+          JS_FreeValue(ctx, req->resolving_funcs[1]);
+          JS_FreeValue(ctx, ns);
+          delete req;
+          continue;
+        }
+        ns_cache_[req->module_name] = JS_DupValue(ctx, ns);
+        JS_Call(ctx, req->resolving_funcs[0], JS_UNDEFINED, 1, &ns);
+        JS_FreeValue(ctx, ns);
+        JS_FreeValue(ctx, req->resolving_funcs[0]);
+        JS_FreeValue(ctx, req->resolving_funcs[1]);
+        delete req;
+      }
+      pending_eval_.clear();
+    }
+  };
+
+  JSModuleLoader module_loader;
 
   // registerModule(name, path): register a module by name and filesystem path.
-  // This is used by the module loader to map module names to file paths.
+  // Kicks off a background read immediately so the source is in RAM by the
+  // time JS code imports it. This is non-blocking — the read happens on the
+  // FreeRTOS reader task.
   void registerModule(const char *name, const char *path) {
     module_cache[name] = path;
+    module_loader.queueRead(name, path);
   }
 
  protected:
@@ -2939,44 +3500,41 @@ class ESP32QuickJS {
     this->ctx = ctx;
     JS_SetContextOpaque(ctx, this);
 
-    // Module loader for filesystem-based module loading
-    // This function is called by QuickJS when a module is requested via import
-    // Format: "filename:module_init_code" where module_init_code is a function
-    // that exports the module's public API
+    // ---- Module loader ----
+    // QuickJS calls this callback when it encounters a static `import`
+    // statement. The callback MUST return a JSModuleDef* synchronously.
+    // We compile the already-loaded source (pre-read by the FreeRTOS
+    // reader task in JSModuleLoader). If the source isn't loaded yet,
+    // we kick off a background read and return nullptr — QuickJS will
+    // throw a ReferenceError, but the module will be available for the
+    // next import attempt. In practice, registerModule() pre-reads
+    // modules at registration time, so they're ready before JS runs.
+    //
+    // The callback also handles relative path resolution: if the
+    // module_name isn't in module_cache, we try resolving it as a
+    // relative path from the filesystem root.
     JS_SetModuleLoaderFunc(
-        qjs->rt,
-        [](JSContext *ctx, const char *module_name, void *opaque) {
+        rt,
+        nullptr,  // default normalizer
+        [](JSContext *ctx, const char *module_name, void *opaque) -> JSModuleDef* {
             ESP32QuickJS* qjs = (ESP32QuickJS*)opaque;
-            // Look for module in qjs->module_cache
-            std::string module_path = qjs->module_cache[module_name];
-            if (module_path.empty()) {
-                return nullptr;
+            // Check if source is already loaded in the module loader cache.
+            if (qjs->module_loader.isLoaded(module_name)) {
+              return qjs->module_loader.loadStatic(ctx, module_name);
             }
-            // Load module code from file using C-style read
-            FILE* f = fopen(module_path.c_str(), "r");
-            if (!f) {
-                return nullptr;
+            // Not loaded — look up the path and kick off a background read.
+            auto it = qjs->module_cache.find(module_name);
+            if (it != qjs->module_cache.end()) {
+              qjs->module_loader.queueRead(module_name, it->second.c_str());
+              // If it's already loaded by now (race: reader finished between
+              // isLoaded and queueRead), try once more.
+              if (qjs->module_loader.isLoaded(module_name)) {
+                return qjs->module_loader.loadStatic(ctx, module_name);
+              }
             }
-            fseek(f, 0, SEEK_END);
-            long fsize = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            char* code = (char*)js_malloc(ctx, fsize + 1);
-            if (!code) {
-                fclose(f);
-                return nullptr;
-            }
-            size_t nread = fread(code, 1, fsize, f);
-            code[nread] = '\0';
-            fclose(f);
-            // Execute module code to get module namespace
-            JSValue module_ns = qjs->eval(code);
-            js_free(ctx, code);
-            if (JS_IsException(module_ns)) {
-                return nullptr;
-            }
-            return JS_GetPropertyStr(ctx, module_ns, "__esModule");
+            return nullptr;  // QuickJS will throw ReferenceError
         },
-        qjs, nullptr);
+        this);
 
     // setup console.log()
     JSValue console = JS_NewObject(ctx);
@@ -2997,10 +3555,21 @@ class ESP32QuickJS {
     JS_SetPropertyStr(ctx, global, "setTimeout",
                       JS_NewCFunction(ctx, set_timeout, "setTimeout", 2));
     JS_SetPropertyStr(ctx, global, "clearTimeout",
-                      JS_NewCFunction(ctx, clear_timeout, "clearTimeout", 1));    JS_SetPropertyStr(ctx, global, "setInterval",
+                      JS_NewCFunction(ctx, clear_timeout, "clearTimeout", 1));
+    JS_SetPropertyStr(ctx, global, "setInterval",
                       JS_NewCFunction(ctx, set_interval, "setInterval", 2));
     JS_SetPropertyStr(ctx, global, "clearInterval",
                       JS_NewCFunction(ctx, clear_timeout, "clearInterval", 1));
+
+    // Module system: async require() and import() that return Promises.
+    // Usage:
+    //   const mod = await require("./fib.js")
+    //   const { fib } = await import("./fib.js")
+    // Both are non-blocking — the file read happens on a FreeRTOS task.
+    JS_SetPropertyStr(ctx, global, "require",
+                      JS_NewCFunction(ctx, js_require, "require", 1));
+    JS_SetPropertyStr(ctx, global, "importModule",
+                      JS_NewCFunction(ctx, js_import, "importModule", 1));
 
 
 #ifdef ENABLE_WIFI
@@ -3302,6 +3871,62 @@ class ESP32QuickJS {
       }
     }
     return JS_UNDEFINED;
+  }
+
+  // ---- Module system: require() and import() ----
+  //
+  // require(name): Synchronous, just like Node.js. Blocks the calling JS
+  // code until the module is loaded and returns the module namespace
+  // directly (NOT a Promise). While waiting for the background file
+  // read to complete, it pumps ESP32QuickJS::loop() so that timers,
+  // WiFi, I2C, pending jobs, etc. all keep running. The file I/O itself
+  // happens on a FreeRTOS task — the JS thread never does blocking I/O.
+  //   const fib = require("./fib.js")   // blocks until loaded, returns module
+  //
+  // importModule(name): ES dynamic import — returns a Promise per spec.
+  //   const { fib } = await importModule("./fib.js")
+  //
+  static JSValue js_require(JSContext *ctx, JSValueConst jsThis, int argc,
+                            JSValueConst *argv) {
+    if (argc < 1 || !JS_IsString(argv[0])) {
+      return JS_ThrowTypeError(ctx, "require: expected module name string");
+    }
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    if (!qjs) return JS_ThrowInternalError(ctx, "require: no context opaque");
+    const char *module_name = JS_ToCString(ctx, argv[0]);
+    if (!module_name) return JS_EXCEPTION;
+
+    // Look up the filesystem path for this module name.
+    auto it = qjs->module_cache.find(module_name);
+    std::string path;
+    if (it != qjs->module_cache.end()) {
+      path = it->second;
+    } else {
+      // If not registered, treat the name itself as the path.
+      path = module_name;
+    }
+    std::string name_str = module_name;
+    JS_FreeCString(ctx, module_name);
+
+    // Synchronous require — blocks JS, pumps event loop while waiting.
+    return qjs->module_loader.requireSync(ctx, qjs, name_str.c_str(), path.c_str());
+  }
+
+  // importModule(name): ES dynamic import — returns a Promise (async).
+  static JSValue js_import(JSContext *ctx, JSValueConst jsThis, int argc,
+                           JSValueConst *argv) {
+    if (argc < 1 || !JS_IsString(argv[0])) {
+      return JS_ThrowTypeError(ctx, "importModule: expected module name string");
+    }
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    if (!qjs) return JS_ThrowInternalError(ctx, "importModule: no context opaque");
+    const char *module_name = JS_ToCString(ctx, argv[0]);
+    if (!module_name) return JS_EXCEPTION;
+    auto it = qjs->module_cache.find(module_name);
+    std::string path = (it != qjs->module_cache.end()) ? it->second : module_name;
+    std::string name_str = module_name;
+    JS_FreeCString(ctx, module_name);
+    return qjs->module_loader.queueAsyncLoad(ctx, name_str.c_str(), path.c_str());
   }
 
   // ---- Memory introspection ----
