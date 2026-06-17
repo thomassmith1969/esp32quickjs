@@ -2742,6 +2742,12 @@ class ESP32QuickJS {
     }
     JS_SetMemoryLimit(rt, memoryLimit);
     JS_SetGCThreshold(rt, memoryLimit >> 3);
+    // Disable QuickJS's C stack overflow check — we run JS on a dedicated
+    // FreeRTOS task whose stack is in a different memory region than the
+    // task that created the runtime. QuickJS captures stack_top at runtime
+    // creation, so the check would always fail on a different task.
+    // The FreeRTOS task stack canary provides our stack overflow protection.
+    JS_SetMaxStackSize(rt, (size_t)-1);  // effectively unlimited
     JSValue global = JS_GetGlobalObject(ctx);
     setup(ctx, global);
     JS_FreeValue(ctx, global);
@@ -2952,23 +2958,68 @@ class ESP32QuickJS {
     uint32_t start_ms_;
     uint32_t timeout_ms_;
 
+    // Optional pump callback registered by main.cpp to keep telnet/serial
+    // sessions alive during blocking waits. When set, tick() calls it
+    // on every iteration so no session freezes while another waits.
+    // Signature: void pump() — should process incoming telnet/serial data.
+    static void (*pumpCallback)();
+
     JSBlockingGuard(JSContext *ctx, ESP32QuickJS *qjs, uint32_t timeout_ms = 5000)
       : ctx_(ctx), qjs_(qjs), start_ms_(millis()), timeout_ms_(timeout_ms) {}
 
     // Pump the event loop once and check timeout.
     // Returns true if timed out, false to keep waiting.
+    // IMPORTANT: This pumps I/O only (timers, WiFi, I2C, telnet/serial,
+    // QuickJS pending jobs). It does NOT call module_loader.loop()
+    // because that does JS_Eval which uses deep C stack and would
+    // overflow the FreeRTOS task stack when called from within
+    // requireSync(). Module evaluation happens via JS_EnqueueJob
+    // which runs at shallow stack depth through JS_ExecutePendingJob.
     bool tick() {
-      // Pump QuickJS pending jobs (Promise callbacks, async/await).
+      // Pump QuickJS pending jobs — this runs module eval jobs
+      // enqueued by requireSync(). Jobs run at shallow stack depth.
       JSContext *c;
       int ret = JS_ExecutePendingJob(JS_GetRuntime(ctx_), &c);
       if (ret < 0) {
         qjs_dump_exception(ctx_, JS_UNDEFINED);
       }
 
-      // Pump the full ESP32QuickJS::loop() so all subsystems keep running.
-      // callLoopFn=false to avoid re-entering the user's JS loop() callback
-      // (which could cause re-entrancy issues).
-      qjs_->loop(false);
+      // Pump I/O subsystems (timers, WiFi, I2C, SPI, servo, etc.)
+      // but NOT module_loader.loop() (which does JS_Eval).
+      uint32_t now = millis();
+      if (qjs_->timer.GetNextTimeout(now) >= 0) {
+        qjs_->timer.ConsumeTimer(ctx_, now);
+      }
+      qjs_->analog.loop(ctx_);
+#ifdef ENABLE_WIFI
+      qjs_->httpFetcher.loop(ctx_);
+      qjs_->webServer.loop();
+#endif
+#ifdef ENABLE_FS
+      qjs_->littlefs.loop(ctx_);
+      qjs_->sd.loop(ctx_);
+#endif
+#ifdef ENABLE_I2C
+      qjs_->i2c.loop(ctx_);
+#endif
+#ifdef ENABLE_SPI
+      qjs_->spi.loop(ctx_);
+#endif
+#ifdef ENABLE_SERVO
+      qjs_->servo.loop(ctx_);
+#endif
+#ifdef ENABLE_ESPNOW
+      qjs_->espNow.loop();
+#endif
+
+      // Pump telnet/serial input so other sessions don't freeze.
+      if (pumpCallback) pumpCallback();
+
+      // Process pending module evaluations (from requireSync()).
+      // This does JS_Eval but we're on the 32KB main loop task so
+      // there's plenty of stack. This is the "heavy lifting" that
+      // belongs in the main loop, not in FreeRTOS tasks.
+      qjs_->module_loader.processPendingEval(ctx_);
 
       // Yield to let the FreeRTOS reader task (core 0) do the actual I/O.
       vTaskDelay(pdMS_TO_TICKS(1));
@@ -3055,27 +3106,34 @@ class ESP32QuickJS {
           if (!LittleFS.begin(false)) {
             req->error = true;
             req->error_msg = "LittleFS mount failed";
-          } else if (LittleFS.exists(req->file_path.c_str())) {
-            File f = LittleFS.open(req->file_path.c_str(), "r");
-            if (!f) {
-              req->error = true;
-              req->error_msg = "EOPEN: " + req->file_path;
-            } else {
-              std::string buf;
-              const size_t CHUNK = 512;
-              uint8_t chunk[CHUNK];
-              while (f.available()) {
-                size_t n = f.read(chunk, CHUNK);
-                if (!n) break;
-                buf.append((const char *)chunk, n);
-              }
-              f.close();
-              req->source = std::move(buf);
-              req->loaded = true;
-            }
           } else {
-            req->error = true;
-            req->error_msg = "ENOENT: " + req->file_path;
+            // Normalize path: LittleFS requires a leading "/".
+            std::string path = req->file_path;
+            if (path.empty() || path[0] != '/') {
+              path = "/" + path;
+            }
+            if (LittleFS.exists(path.c_str())) {
+              File f = LittleFS.open(path.c_str(), "r");
+              if (!f) {
+                req->error = true;
+                req->error_msg = "EOPEN: " + path;
+              } else {
+                std::string buf;
+                const size_t CHUNK = 512;
+                uint8_t chunk[CHUNK];
+                while (f.available()) {
+                  size_t n = f.read(chunk, CHUNK);
+                  if (!n) break;
+                  buf.append((const char *)chunk, n);
+                }
+                f.close();
+                req->source = std::move(buf);
+                req->loaded = true;
+              }
+            } else {
+              req->error = true;
+              req->error_msg = "ENOENT: " + path;
+            }
           }
 #else
           req->error = true;
@@ -3161,12 +3219,104 @@ class ESP32QuickJS {
       return m;
     }
 
+    // ---- Synchronous HTTP fetch ----
+    // Fetches a URL and stores the response body in `out`.
+    // Blocks the JS thread while pumping the event loop (JSBlockingGuard)
+    // so timers/WiFi/I2C/etc. all keep running.
+    // Returns true on success, false on failure.
+    bool fetchSync(JSContext *ctx, ESP32QuickJS *qjs,
+                   const std::string &url, std::string &out) {
+#ifdef ENABLE_WIFI
+      if (WiFi.status() != WL_CONNECTED) return false;
+
+      // Set up a global state object for the fetch result.
+      JSValue g = JS_GetGlobalObject(ctx);
+      JSValue state_obj = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, state_obj, "done", JS_NewBool(ctx, false));
+      JS_SetPropertyStr(ctx, state_obj, "ok", JS_NewBool(ctx, false));
+      JS_SetPropertyStr(ctx, state_obj, "body", JS_NewString(ctx, ""));
+      JS_SetPropertyStr(ctx, g, "__fetch_state", state_obj);
+      JS_FreeValue(ctx, g);
+
+      // Evaluate a script that calls WiFi.fetch and chains .then/.catch.
+      std::string script = std::string(
+        "globalThis.__fetch_state.done = false;\n"
+        "globalThis.__fetch_state.ok = false;\n"
+        "globalThis.__fetch_state.body = '';\n"
+        "WiFi.fetch(\"") + url + "\").then(function(r) {\n"
+        "  globalThis.__fetch_state.done = true;\n"
+        "  globalThis.__fetch_state.ok = true;\n"
+        "  globalThis.__fetch_state.body = r.body;\n"
+        "}).catch(function(e) {\n"
+        "  globalThis.__fetch_state.done = true;\n"
+        "  globalThis.__fetch_state.ok = false;\n"
+        "});\n";
+
+      JSValue eval_ret = JS_Eval(ctx, script.c_str(), script.size(),
+                                 "<fetch>", JS_EVAL_TYPE_GLOBAL);
+      if (JS_IsException(eval_ret)) {
+        qjs_dump_exception(ctx, eval_ret);
+        JS_FreeValue(ctx, eval_ret);
+        JSValue gg = JS_GetGlobalObject(ctx);
+        JS_SetPropertyStr(ctx, gg, "__fetch_state", JS_UNDEFINED);
+        JS_FreeValue(ctx, gg);
+        return false;
+      }
+      JS_FreeValue(ctx, eval_ret);
+
+      // Pump the event loop until the fetch completes.
+      JSBlockingGuard guard(ctx, qjs, 10000);
+      guard.wait([&]() {
+        JSValue gg = JS_GetGlobalObject(ctx);
+        JSValue st = JS_GetPropertyStr(ctx, gg, "__fetch_state");
+        JSValue d = JS_GetPropertyStr(ctx, st, "done");
+        bool isDone = JS_ToBool(ctx, d);
+        JS_FreeValue(ctx, d);
+        JS_FreeValue(ctx, st);
+        JS_FreeValue(ctx, gg);
+        return isDone;
+      });
+
+      // Read the result.
+      JSValue gg = JS_GetGlobalObject(ctx);
+      JSValue st = JS_GetPropertyStr(ctx, gg, "__fetch_state");
+      JSValue ok_val = JS_GetPropertyStr(ctx, st, "ok");
+      JSValue body_val = JS_GetPropertyStr(ctx, st, "body");
+      bool wasOk = JS_ToBool(ctx, ok_val);
+      if (wasOk && JS_IsString(body_val)) {
+        const char *str = JS_ToCString(ctx, body_val);
+        if (str) {
+          out = str;
+          JS_FreeCString(ctx, str);
+        }
+      }
+      JS_FreeValue(ctx, ok_val);
+      JS_FreeValue(ctx, body_val);
+      JS_FreeValue(ctx, st);
+      JS_SetPropertyStr(ctx, gg, "__fetch_state", JS_UNDEFINED);
+      JS_FreeValue(ctx, gg);
+
+      return wasOk && !out.empty();
+#else
+      return false;
+#endif
+    }
+
     // ---- Synchronous require() path ----
     // Blocks the JS thread until the module is loaded, but pumps
     // ESP32QuickJS::loop() while waiting so timers/WiFi/I2C keep running.
     // The file read happens on the FreeRTOS reader task — the JS thread
     // never does blocking I/O. Returns the module namespace directly
     // (NOT a Promise), exactly like Node.js require().
+    //
+    // IMPORTANT: The actual JS_Eval (module parsing/evaluation) does NOT
+    // happen here. It happens in loop() on the next tick. This avoids
+    // deep call stacks (requireSync → evalModuleAndGetNS → JS_Eval) that
+    // would overflow the FreeRTOS task stack. Instead:
+    //   1. Queue the file read (background task)
+    //   2. Wait for the read (pumping loop)
+    //   3. Queue the module for evaluation in loop()
+    //   4. Wait for the namespace to appear in ns_cache_ (pumping loop)
     JSValue requireSync(JSContext *ctx, ESP32QuickJS *qjs,
                         const char *module_name, const char *file_path) {
       // Check namespace cache first — already loaded module.
@@ -3185,32 +3335,86 @@ class ESP32QuickJS {
         // Kick off a background read if not already pending.
         queueRead(module_name, file_path);
 
-        // Block the JS thread while pumping the event loop.
-        // JSBlockingGuard keeps timers, WiFi, I2C, pending jobs, etc.
-        // all running. The FreeRTOS reader task does the actual file I/O.
+        // Wait for the file read to complete (pumping the event loop).
         JSBlockingGuard guard(ctx, qjs, 5000);
-        if (!guard.wait([&]() { return isLoaded(module_name); })) {
+        if (!guard.wait([&]() { return isDone(module_name); })) {
           return JS_ThrowReferenceError(ctx,
             "require: timeout loading module '%s' from '%s'",
             module_name, file_path);
         }
       }
 
-      // Source is now loaded — evaluate as module on the JS thread.
+      // Get the source. If empty, the file wasn't found — try internet.
       std::string src = getSource(module_name);
       if (src.empty()) {
+#ifdef ENABLE_WIFI
+        if (WiFi.status() == WL_CONNECTED) {
+          std::string url = "http://www.espruino.com/modules/";
+          std::string mod = module_name;
+          if (!mod.empty() && mod[0] == '/') mod = mod.substr(1);
+          if (!fetchSync(ctx, qjs, url + mod + ".min.js", src) &&
+              !fetchSync(ctx, qjs, url + mod + ".js", src)) {
+            return JS_ThrowReferenceError(ctx,
+              "require: module '%s' not found on filesystem or internet",
+              module_name);
+          }
+        } else {
+          return JS_ThrowReferenceError(ctx,
+            "require: module '%s' not found (no WiFi for internet fetch)",
+            module_name);
+        }
+#else
         return JS_ThrowReferenceError(ctx,
-          "require: empty source for module '%s'", module_name);
+          "require: module '%s' not found (ENABLE_WIFI not set)",
+          module_name);
+#endif
       }
 
-      JSValue ns = evalModuleAndGetNS(ctx, src, module_name);
-      if (JS_IsException(ns)) {
-        return JS_EXCEPTION;
+      // Enqueue a QuickJS job to evaluate the module. Jobs run via
+      // JS_ExecutePendingJob at shallow stack depth (not nested inside
+      // the requireSync call chain). This avoids stack overflow.
+      // The job stores the namespace in ns_cache_.
+      // We pass the source and module name via a heap-allocated struct.
+      struct EvalJobData {
+        JSModuleLoader *self;
+        std::string module_name;
+        std::string source;
+      };
+      EvalJobData *jobData = new EvalJobData();
+      jobData->self = this;
+      jobData->module_name = module_name;
+      jobData->source = src;
+
+      // JS_EnqueueJob takes a C function + argv. We pass the pointer
+      // as a JSValue (external integer).
+      JSValue jobArg = JS_MKPTR(JS_TAG_INT, jobData);
+      JS_EnqueueJob(ctx, [](JSContext *ctx, int argc, JSValueConst *argv) -> JSValue {
+        auto *data = (EvalJobData *)JS_VALUE_GET_PTR(argv[0]);
+        JSValue ns = evalModuleAndGetNS(ctx, data->source, data->module_name.c_str());
+        if (!JS_IsException(ns)) {
+          data->self->ns_cache_[data->module_name] = JS_DupValue(ctx, ns);
+        }
+        JS_FreeValue(ctx, ns);
+        delete data;
+        return JS_UNDEFINED;
+      }, 1, &jobArg);
+      // JS_EnqueueJob may dup the argv, so free our ref.
+      // Actually JS_EnqueueJob copies argv values, so we need to not
+      // free jobArg since it's a pointer-tagged int (no refcount).
+      // The job function will delete jobData.
+
+      // Wait for the namespace to appear in ns_cache_.
+      // JSBlockingGuard::tick() pumps JS_ExecutePendingJob which runs
+      // the job at shallow stack depth, then pumps I/O.
+      JSBlockingGuard guard2(ctx, qjs, 5000);
+      if (!guard2.wait([&]() {
+        return ns_cache_.find(module_name) != ns_cache_.end();
+      })) {
+        return JS_ThrowReferenceError(ctx,
+          "require: timeout evaluating module '%s'", module_name);
       }
 
-      // Cache the namespace for future require() calls.
-      ns_cache_[module_name] = JS_DupValue(ctx, ns);
-      return ns;  // Return the namespace directly (not a Promise).
+      return JS_DupValue(ctx, ns_cache_[module_name]);
     }
 
     // ---- Async require()/import() path ----
@@ -3304,6 +3508,15 @@ class ESP32QuickJS {
       return has;
     }
 
+    // Check if a module load is done (loaded or errored).
+    bool isDone(const char *module_name) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      auto it = cache_.find(module_name);
+      bool done = (it != cache_.end()) && (it->second->loaded || it->second->error);
+      xSemaphoreGive(mutex_);
+      return done;
+    }
+
     // Get cached source (for static import compilation).
     std::string getSource(const char *module_name) {
       xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -3315,8 +3528,40 @@ class ESP32QuickJS {
 
   private:
     // Requests whose source is loaded and need evaluation + promise resolution.
-    // Processed in loop() on the JS thread (QuickJS is not thread-safe).
+    // Processed in loop() and by JSBlockingGuard::tick() on the JS thread.
     std::vector<LoadRequest*> pending_eval_;
+
+    // Process pending_eval_ entries — evaluate modules and cache namespaces.
+    // Called from both loop() (normal operation) and tick() (blocking waits).
+    // This is the "heavy lifting" — JS_Eval — and it runs on the main loop
+    // task which has a large stack (32KB).
+  public:
+    void processPendingEval(JSContext *ctx) {
+      for (auto *req : pending_eval_) {
+        JSValue ns = evalModuleAndGetNS(ctx, req->source, req->module_name.c_str());
+        if (JS_IsException(ns)) {
+          if (req->has_promise) {
+            JSValue exc = JS_GetException(ctx);
+            JS_Call(ctx, req->resolving_funcs[1], JS_UNDEFINED, 1, &exc);
+            JS_FreeValue(ctx, exc);
+            JS_FreeValue(ctx, req->resolving_funcs[0]);
+            JS_FreeValue(ctx, req->resolving_funcs[1]);
+          }
+          JS_FreeValue(ctx, ns);
+          delete req;
+          continue;
+        }
+        ns_cache_[req->module_name] = JS_DupValue(ctx, ns);
+        if (req->has_promise) {
+          JS_Call(ctx, req->resolving_funcs[0], JS_UNDEFINED, 1, &ns);
+          JS_FreeValue(ctx, req->resolving_funcs[0]);
+          JS_FreeValue(ctx, req->resolving_funcs[1]);
+        }
+        JS_FreeValue(ctx, ns);
+        delete req;
+      }
+      pending_eval_.clear();
+    }
 
     // Compile + evaluate a module from source, return its namespace.
     // Returns JS_EXCEPTION on error.
@@ -3328,8 +3573,25 @@ class ESP32QuickJS {
     // still JS_UNDEFINED (not yet built), we trigger the build by
     // evaluating a wrapper import that forces js_get_module_ns() to
     // run, which populates the field.
+    // Evaluate a module from source and return its namespace/exports.
+    // Handles both ES modules (export/import) and CommonJS modules
+    // (exports.foo = ..., module.exports = ...).
     static JSValue evalModuleAndGetNS(JSContext *ctx, const std::string &src,
                                       const char *module_name) {
+      // Detect whether the source is an ES module or CommonJS.
+      bool is_es_module = JS_DetectModule(src.c_str(), src.size());
+
+      if (is_es_module) {
+        return evalESModuleAndGetNS(ctx, src, module_name);
+      } else {
+        return evalCommonJSAndGetNS(ctx, src, module_name);
+      }
+    }
+
+  private:
+    // ES module path: compile, evaluate, extract namespace.
+    static JSValue evalESModuleAndGetNS(JSContext *ctx, const std::string &src,
+                                        const char *module_name) {
       // Step 1: Compile and evaluate the module.
       JSValue func_val = JS_Eval(ctx, src.c_str(), src.size(), module_name,
                                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -3390,6 +3652,50 @@ class ESP32QuickJS {
           "require: module namespace not built for '%s'", module_name);
       }
       return JS_DupValue(ctx, mod->module_ns);
+    }
+
+    // CommonJS path: evaluate source as a script with `exports` and
+    // `module` in scope, return the exports object.
+    // We prepend `var exports = {}, module = {exports: exports};` to
+    // the source and evaluate as a global script. This avoids the
+    // stack overhead of a function wrapper.
+    // Supports: exports.foo = ..., module.exports = ..., exports = ...
+    static JSValue evalCommonJSAndGetNS(JSContext *ctx, const std::string &src,
+                                        const char *module_name) {
+      std::string wrapped = std::string(
+        "var exports = {};\n"
+        "var module = { exports: exports };\n"
+        "var require = globalThis.require;\n") +
+        src + "\n";
+
+      JSValue eval_ret = JS_Eval(ctx, wrapped.c_str(), wrapped.size(),
+                                 module_name, JS_EVAL_TYPE_GLOBAL);
+      if (JS_IsException(eval_ret)) {
+        qjs_dump_exception(ctx, eval_ret);
+        JS_FreeValue(ctx, eval_ret);
+        return JS_EXCEPTION;
+      }
+      JS_FreeValue(ctx, eval_ret);
+
+      // Read back module.exports from the global scope.
+      JSValue global = JS_GetGlobalObject(ctx);
+      JSValue mod = JS_GetPropertyStr(ctx, global, "module");
+      JS_FreeValue(ctx, global);
+      if (JS_IsException(mod) || JS_IsUndefined(mod)) {
+        JS_FreeValue(ctx, mod);
+        return JS_ThrowInternalError(ctx,
+          "require: CommonJS module '%s' did not define module", module_name);
+      }
+      JSValue mod_exports = JS_GetPropertyStr(ctx, mod, "exports");
+      JS_FreeValue(ctx, mod);
+
+      if (JS_IsObject(mod_exports) || JS_IsString(mod_exports) ||
+          JS_IsNumber(mod_exports)) {
+        return mod_exports;
+      }
+      JS_FreeValue(ctx, mod_exports);
+      return JS_ThrowInternalError(ctx,
+        "require: CommonJS module '%s' did not set exports", module_name);
     }
 
   public:
@@ -3456,26 +3762,9 @@ class ESP32QuickJS {
       }
 
       // Also process any pending_eval_ requests (source already loaded).
-      for (auto *req : pending_eval_) {
-        JSValue ns = evalModuleAndGetNS(ctx, req->source, req->module_name.c_str());
-        if (JS_IsException(ns)) {
-          JSValue exc = JS_GetException(ctx);
-          JS_Call(ctx, req->resolving_funcs[1], JS_UNDEFINED, 1, &exc);
-          JS_FreeValue(ctx, exc);
-          JS_FreeValue(ctx, req->resolving_funcs[0]);
-          JS_FreeValue(ctx, req->resolving_funcs[1]);
-          JS_FreeValue(ctx, ns);
-          delete req;
-          continue;
-        }
-        ns_cache_[req->module_name] = JS_DupValue(ctx, ns);
-        JS_Call(ctx, req->resolving_funcs[0], JS_UNDEFINED, 1, &ns);
-        JS_FreeValue(ctx, ns);
-        JS_FreeValue(ctx, req->resolving_funcs[0]);
-        JS_FreeValue(ctx, req->resolving_funcs[1]);
-        delete req;
-      }
-      pending_eval_.clear();
+      // These come from requireSync() (has_promise=false) and
+      // queueAsyncLoad() (has_promise=true).
+      processPendingEval(ctx);
     }
   };
 
@@ -4652,3 +4941,6 @@ class ESP32QuickJS {
   }
 #endif
 };
+
+// Static member definition — must be at file scope.
+void (*ESP32QuickJS::JSBlockingGuard::pumpCallback)() = nullptr;
