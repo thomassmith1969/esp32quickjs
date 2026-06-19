@@ -23,7 +23,10 @@
     "flags": "-DCONFIG_VERSION=\\\"2020-11-08\\\"",
     "srcFilter": [
       "+<*.c>",
+      "+<*.cpp>",
+      "+<esp32/*.cpp>",
       "+<*.h>",
+      "+<esp32/*.h>",
       "-<tests/>",
       "-<examples/>",
       "-<doc/>",

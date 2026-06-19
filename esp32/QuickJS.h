@@ -1,22 +1,13 @@
 #pragma once
 
-#if defined(WiFi_h) && !defined(ENABLE_WIFI)
-#define ENABLE_WIFI
-#endif
 
 // ENABLE_FS is opt-in: define it from build_flags or before including QuickJS.h.
 // LittleFS / SD are always available on Arduino-ESP32, but we keep the gate to
 // stay consistent with ENABLE_WIFI.
-#if !defined(ENABLE_FS) && (defined(LittleFS_h) || defined(_SD_H_) || defined(SD_H) || defined(GLOBAL_ESP32))
-#define ENABLE_FS
-#endif
 
 // ENABLE_ESPNOW: there is no Arduino-style header to test against, so we
 // gate on GLOBAL_ESP32 the same way ENABLE_FS does. Users can still force it
 // with -DENABLE_ESPNOW.
-#if !defined(ENABLE_ESPNOW) && defined(GLOBAL_ESP32)
-#define ENABLE_ESPNOW
-#endif
 
 // Forward declaration of the main embed class. JSAnalog (defined
 // above ESP32QuickJS in this file) needs to look up the qjs
@@ -25,6 +16,9 @@
 class ESP32QuickJS;
 
 #include <Arduino.h>
+
+#include "RotaryEncoder.h"
+#include "JSRotaryEncoder.h"
 
 #include <algorithm>
 #include <vector>
@@ -51,27 +45,15 @@ extern int currentTelnetId;
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-#ifdef ENABLE_WIFI
 #include <HTTPClient.h>
 #include <Server.h>
 #include <StreamString.h>
-#endif
 
-#if defined(ENABLE_I2C) || defined(GLOBAL_ESP32)
-#ifndef ENABLE_I2C
-#define ENABLE_I2C
-#endif
 #include <driver/i2c.h>
-#endif
 
-#if defined(ENABLE_SPI) || defined(GLOBAL_ESP32)
-#ifndef ENABLE_SPI
-#define ENABLE_SPI
-#endif
 #include <driver/spi_common.h>
 #include <driver/spi_master.h>
 #include <SPI.h>  // for SPISettings, used as a convenience
-#endif
 
 // JSServo uses ServoEasing.h, a high-level Arduino-ESP32 library that
 // runs on the LEDC peripheral via the stock Arduino Servo driver.
@@ -81,24 +63,14 @@ extern int currentTelnetId;
 // directly because that file contains both the class definition and
 // the inline implementations (it's a header-only library). The
 // accompanying .h is just a version-stub forwarder.
-#if defined(ENABLE_SERVO) || defined(GLOBAL_ESP32)
-#ifndef ENABLE_SERVO
-#define ENABLE_SERVO
-#endif
-#define SUPPRESS_HPP_WARNING 1
 #include <ServoEasing.hpp>
-#endif
 
-#ifdef ENABLE_FS
 #include <LittleFS.h>
 #include <SD.h>
-#endif
 
-#ifdef ENABLE_ESPNOW
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
-#endif
 
 #include "../quickjs.h"
 
@@ -163,7 +135,6 @@ static void qjs_print_value_to(JSContext *ctx, JSValueConst v, Print* out) {
   JS_FreeValue(ctx, global);
 }
 
-#ifdef ENABLE_WIFI
 class JSHttpFetcher {
   struct Entry {
     HTTPClient *client;
@@ -452,7 +423,6 @@ public:
         return promise;
     }
 };
-#endif
 
 class JSTimer {
   struct TimerEntry {
@@ -717,9 +687,9 @@ class JSAnalog {
     // Detach the interrupt. touchDetachInterrupt is the inverse of
     // touchAttachInterrupt. Falls back to no-op on cores that don't
     // have it (older Arduino-ESP32).
-    #ifdef touchDetachInterrupt
+
     touchDetachInterrupt(tl.pin);
-    #endif
+    
     JS_FreeValue(ctx, tl.js_callback);
     tl.js_callback = JS_UNDEFINED;
     tl.active = false;
@@ -961,7 +931,6 @@ class JSAnalog {
 // Static instance pointer for ISR → listener lookup.
 JSAnalog* JSAnalog::instance = nullptr;
 
-#ifdef ENABLE_I2C
 // Promise-based I2C bus wrapper.
 //
 // Usage from JS:
@@ -1404,9 +1373,7 @@ class JSI2C {
   std::vector<Entry> queue;
 };
 JSI2C* JSI2C::instance = nullptr;
-#endif  // ENABLE_I2C
 
-#ifdef ENABLE_SPI
 // Promise-based SPI bus wrapper.
 //
 // Usage from JS:
@@ -1833,9 +1800,7 @@ class JSSPI {
   std::vector<Entry> queue;
 };
 JSSPI* JSSPI::instance = nullptr;
-#endif  // ENABLE_SPI
 
-#ifdef ENABLE_SERVO
 // Promise-based hobby-servo driver backed by ServoEasing.h, a high-
 // level Arduino-ESP32 library that runs on the LEDC peripheral via
 // the stock Arduino Servo driver. Non-blocking easing moves are
@@ -2162,9 +2127,7 @@ class JSServo {
   }
 };
 JSServo* JSServo::instance = nullptr;
-#endif  // ENABLE_SERVO
 
-#ifdef ENABLE_FS
 // Generic Promise-style filesystem backend. Works with any Arduino FS (LittleFS, SD, ...).
 // Mirrors the JSHttpFetcher style: queue entries, poll from ESP32QuickJS::loop().
 class JSFileSystem {
@@ -2380,9 +2343,6 @@ class JSSD {
   }
   void end() { SD.end(); }
 };
-#endif  // ENABLE_FS
-
-#ifdef ENABLE_ESPNOW
 // JSEspNow bridges the C esp_now API to QuickJS. Goals:
 //   * Hide peer lifecycle behind a friendly JS surface
 //   * Make sends Promise-based: ESPNow.send() resolves when the radio reports
@@ -2681,7 +2641,6 @@ class JSEspNow {
   }
 };
 JSEspNow *JSEspNow::instance = nullptr;
-#endif  // ENABLE_ESPNOW
 
 class ESP32QuickJS {
  public:
@@ -2694,28 +2653,16 @@ class ESP32QuickJS {
   // Analog I/O and touch listeners. Always available (no feature
   // flag — uses on-chip ADC / LEDC / touch hardware).
   JSAnalog analog;
-#ifdef ENABLE_WIFI
   JSHttpFetcher httpFetcher;
   JSWebServer webServer;
-#endif
-#ifdef ENABLE_FS
   JSFileSystem littlefs;
   JSFileSystem sd;
   bool littlefsMounted = false;
   bool sdMounted = false;
-#endif
-#ifdef ENABLE_I2C
   JSI2C i2c;
-#endif
-#ifdef ENABLE_SPI
   JSSPI spi;
-#endif
-#ifdef ENABLE_SERVO
   JSServo servo;
-#endif
-#ifdef ENABLE_ESPNOW
   JSEspNow espNow;
-#endif
 
   void begin() {
     JSRuntime *rt = JS_NewRuntime();
@@ -2748,44 +2695,28 @@ class ESP32QuickJS {
     // Initialize the non-blocking module loader (spawns FreeRTOS reader task).
     module_loader.init(ctx);
     analog.init();
-#ifdef ENABLE_I2C
     JSI2C::instance = &i2c;
-#endif
-#ifdef ENABLE_SPI
     JSSPI::instance = &spi;
-#endif
-#ifdef ENABLE_SERVO
     JSServo::instance = &servo;
     servo.analog = &analog;  // let servo.attach reject pins LEDC owns
     servo.init();
-#endif
-#ifdef ENABLE_ESPNOW
     // Wire the static trampoline so C callbacks can find this instance.
     JSEspNow::instance = &espNow;
     espNow.ctx = ctx;
-#endif
   }
 
   void end() {
     timer.RemoveAll(ctx);
     analog.end(ctx);
-#ifdef ENABLE_I2C
     i2c.end(ctx);
     JSI2C::instance = nullptr;
-#endif
-#ifdef ENABLE_SPI
     spi.end(ctx);
     JSSPI::instance = nullptr;
-#endif
-#ifdef ENABLE_SERVO
     servo.end(ctx);
     JSServo::instance = nullptr;
-#endif
-#ifdef ENABLE_ESPNOW
     if (espNow.isInitialized()) espNow.end();
     espNow.clearHandlers();
     JSEspNow::instance = nullptr;
-#endif
     // Stop the module loader background task and free cached modules.
     module_loader.end();
     JS_FreeContext(ctx);
@@ -2813,26 +2744,14 @@ class ESP32QuickJS {
     // Analog I/O + touch listeners (always available, no flag)
     analog.loop(ctx);
 
-#ifdef ENABLE_WIFI
     httpFetcher.loop(ctx);
     webServer.loop();
-#endif
-#ifdef ENABLE_FS
     littlefs.loop(ctx);
     sd.loop(ctx);
-#endif
-#ifdef ENABLE_I2C
     i2c.loop(ctx);
-#endif
-#ifdef ENABLE_SPI
     spi.loop(ctx);
-#endif
-#ifdef ENABLE_SERVO
     servo.loop(ctx);
-#endif
-#ifdef ENABLE_ESPNOW
     espNow.loop();
-#endif
 
     // loop()
     if (callLoopFn && JS_IsFunction(ctx, loop_func)) {
@@ -2985,26 +2904,14 @@ class ESP32QuickJS {
         qjs_->timer.ConsumeTimer(ctx_, now);
       }
       qjs_->analog.loop(ctx_);
-#ifdef ENABLE_WIFI
       qjs_->httpFetcher.loop(ctx_);
       qjs_->webServer.loop();
-#endif
-#ifdef ENABLE_FS
       qjs_->littlefs.loop(ctx_);
       qjs_->sd.loop(ctx_);
-#endif
-#ifdef ENABLE_I2C
       qjs_->i2c.loop(ctx_);
-#endif
-#ifdef ENABLE_SPI
       qjs_->spi.loop(ctx_);
-#endif
-#ifdef ENABLE_SERVO
       qjs_->servo.loop(ctx_);
-#endif
-#ifdef ENABLE_ESPNOW
       qjs_->espNow.loop();
-#endif
 
       // Pump telnet/serial input so other sessions don't freeze.
       if (pumpCallback) pumpCallback();
@@ -3095,7 +3002,6 @@ class ESP32QuickJS {
           // Read the file using the Arduino File API (LittleFS/SD).
           // This is the blocking part, but we're on a separate task so
           // the JS engine never stalls.
-#ifdef ENABLE_FS
           // Ensure LittleFS is mounted before trying to read.
           if (!LittleFS.begin(false)) {
             req->error = true;
@@ -3129,10 +3035,6 @@ class ESP32QuickJS {
               req->error_msg = "ENOENT: " + path;
             }
           }
-#else
-          req->error = true;
-          req->error_msg = "filesystem not enabled (ENABLE_FS)";
-#endif
 
           // Store in cache under the mutex.
           xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -3220,7 +3122,6 @@ class ESP32QuickJS {
     // Returns true on success, false on failure.
     bool fetchSync(JSContext *ctx, ESP32QuickJS *qjs,
                    const std::string &url, std::string &out) {
-#ifdef ENABLE_WIFI
       if (WiFi.status() != WL_CONNECTED) return false;
 
       // Set up a global state object for the fetch result.
@@ -3291,9 +3192,6 @@ class ESP32QuickJS {
       JS_FreeValue(ctx, gg);
 
       return wasOk && !out.empty();
-#else
-      return false;
-#endif
     }
 
     // ---- Synchronous require() path ----
@@ -3341,7 +3239,6 @@ class ESP32QuickJS {
       // Get the source. If empty, the file wasn't found — try internet.
       std::string src = getSource(module_name);
       if (src.empty()) {
-#ifdef ENABLE_WIFI
         if (WiFi.status() == WL_CONNECTED) {
           std::string url = "http://www.espruino.com/modules/";
           std::string mod = module_name;
@@ -3357,11 +3254,6 @@ class ESP32QuickJS {
             "require: module '%s' not found (no WiFi for internet fetch)",
             module_name);
         }
-#else
-        return JS_ThrowReferenceError(ctx,
-          "require: module '%s' not found (ENABLE_WIFI not set)",
-          module_name);
-#endif
       }
 
       // Enqueue a QuickJS job to evaluate the module. Jobs run via
@@ -3855,7 +3747,6 @@ class ESP32QuickJS {
                       JS_NewCFunction(ctx, js_import, "importModule", 1));
 
 
-#ifdef ENABLE_WIFI
     JSValue wifi = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, global, "WiFi", wifi);
     
@@ -3890,9 +3781,7 @@ class ESP32QuickJS {
     };
     JS_SetPropertyFunctionList(ctx, wifi, wifi_funcs, sizeof(wifi_funcs) / sizeof(JSCFunctionListEntry));
     // Do not free wifi here, it is owned by the global object
-#endif
 
-#ifdef ENABLE_FS
     // FS = { LittleFS: { readFile, writeFile, removeFile, listFiles },
     //        SD:       { init, readFile, writeFile, removeFile, listFiles } }
     JSValue fs = JS_NewObject(ctx);
@@ -3940,9 +3829,7 @@ class ESP32QuickJS {
     };
     JS_SetPropertyFunctionList(ctx, sdfs, sd_funcs,
                                sizeof(sd_funcs) / sizeof(JSCFunctionListEntry));
-#endif
 
-#ifdef ENABLE_ESPNOW
     // ESPNow = { init, end, addPeer, delPeer, peerExists, send, broadcast,
     //            onReceive, onSend, BROADCAST_ADDR, MAX_DATA_LEN }
     JSValue en = JS_NewObject(ctx);
@@ -3990,7 +3877,6 @@ class ESP32QuickJS {
     };
     JS_SetPropertyFunctionList(ctx, en, en_funcs,
                                sizeof(en_funcs) / sizeof(JSCFunctionListEntry));
-#endif
 
     static const JSCFunctionListEntry esp32_funcs[] = {
         JSCFunctionListEntry{"millis", 0, JS_DEF_CFUNC, 0, {
@@ -4034,7 +3920,6 @@ class ESP32QuickJS {
                              }},
     };
 
-#ifdef ENABLE_I2C
     // I2C = { open, close, write, read, writeRead }
     // All functions are async; they return Promises that resolve when the
     // queued operation completes in ESP32QuickJS::loop(). Bus handles are
@@ -4062,9 +3947,6 @@ class ESP32QuickJS {
       JS_SetPropertyFunctionList(ctx, i2cObj, i2c_funcs,
                                  sizeof(i2c_funcs) / sizeof(JSCFunctionListEntry));
     }
-#endif
-
-#ifdef ENABLE_SPI
     // SPI = { open, close, transfer, write, read }
     // All functions are async; they return Promises that resolve when the
     // queued operation completes in ESP32QuickJS::loop(). Device handles
@@ -4092,9 +3974,6 @@ class ESP32QuickJS {
       JS_SetPropertyFunctionList(ctx, spiObj, spi_funcs,
                                  sizeof(spi_funcs) / sizeof(JSCFunctionListEntry));
     }
-#endif
-
-#ifdef ENABLE_SERVO
     // servo = { attach, detach, write, writeUs }
     // All four return Promises; the actual MCPWM setup runs in loop().
     {
@@ -4117,7 +3996,35 @@ class ESP32QuickJS {
       JS_SetPropertyFunctionList(ctx, servoObj, servo_funcs,
                                  sizeof(servo_funcs) / sizeof(JSCFunctionListEntry));
     }
-#endif
+
+    {
+      // Register the RotaryEncoder class. Pattern follows the Worker
+      // class in quickjs-libc.c:
+      //   1. Allocate a class id (once per process).
+      //   2. Register the class definition with the runtime.
+      //   3. Build a prototype object with the methods.
+      //   4. Build a constructor function and link it to the prototype.
+      //   5. Bind the prototype to the class id so JS_NewObjectClass
+      //      picks it up automatically.
+      //   6. Expose the constructor as a global so JS can `new` it.
+      JSRuntime *rt = JS_GetRuntime(ctx);
+      JS_NewClassID(&JSRotaryEncoder::js_class_id);
+      JS_NewClass(rt, JSRotaryEncoder::js_class_id,
+                  &JSRotaryEncoder::js_class_def);
+
+      JSValue proto = JS_NewObject(ctx);
+      JS_SetPropertyStr(
+          ctx, proto, "position",
+          JS_NewCFunction(ctx, JSRotaryEncoder::js_position, "position", 1));
+
+      JSValue ctor = JS_NewCFunction2(ctx, JSRotaryEncoder::js_ctor,
+                                      "RotaryEncoder", 2,
+                                      JS_CFUNC_constructor, 0);
+      JS_SetConstructor(ctx, ctor, proto);
+      JS_SetClassProto(ctx, JSRotaryEncoder::js_class_id, proto);
+
+      JS_SetPropertyStr(ctx, global, "RotaryEncoder", ctor);
+    }
 
 #ifndef GLOBAL_ESP32
     JSModuleDef *m =
@@ -4334,9 +4241,7 @@ class ESP32QuickJS {
     // servo.detach) first.
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     if (qjs && (qjs->analog.isPinBusy((uint8_t)pin)
-#ifdef ENABLE_SERVO
                || qjs->servo.isPinBusy((uint8_t)pin)
-#endif
         )) {
       return JS_ThrowReferenceError(ctx,
         "digitalRead: pin %u is in use by analog/servo output", (unsigned)pin);
@@ -4391,9 +4296,7 @@ class ESP32QuickJS {
     JS_ToUint32(ctx, &pin, argv[0]);
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     if (qjs && (qjs->analog.isPinBusy((uint8_t)pin)
-#ifdef ENABLE_SERVO
                || qjs->servo.isPinBusy((uint8_t)pin)
-#endif
         )) {
       // Return a Promise that rejects immediately, mirroring the
       // normal "queued then rejected" path. The caller can .catch()
@@ -4486,7 +4389,6 @@ class ESP32QuickJS {
     return JS_UNDEFINED;
   }
 
-#ifdef ENABLE_WIFI
   static JSValue wifi_is_connected(JSContext *ctx, JSValueConst jsThis,
                                    int argc, JSValueConst *argv) {
     return JS_NewBool(ctx, WiFi.status() == WL_CONNECTED);
@@ -4561,9 +4463,7 @@ class ESP32QuickJS {
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     return qjs->httpFetcher.fetch(ctx, argv[0], argv[1]);
   }
-#endif
 
-#ifdef ENABLE_FS
   // Auto-mount LittleFS at setup if not already mounted. Mirrors the wifi
   // "always present" pattern: a global is available, no JS call required to
   // mount it, and it just works the moment JS runs.
@@ -4713,9 +4613,7 @@ class ESP32QuickJS {
     if (path) JS_FreeCString(ctx, path);
     return p;
   }
-#endif
 
-#ifdef ENABLE_ESPNOW
   // ---- ESPNow JS bridge helpers (static) ----
   // Decode a MAC value coming from JS: either "AA:BB:CC:DD:EE:FF" or a
   // 6-element number array. Writes 6 bytes into out_mac. Returns true on
@@ -4933,8 +4831,11 @@ class ESP32QuickJS {
     qjs->espNow.setSendHandler(ctx, argv[0]);
     return JS_UNDEFINED;
   }
-#endif
 };
 
 // Static member definition — must be at file scope.
 void (*ESP32QuickJS::JSBlockingGuard::pumpCallback)() = nullptr;
+
+// RotaryEncoder is implemented in its own files (RotaryEncoder.h/.cpp
+// for the native object, JSRotaryEncoder.h/.cpp for the JS wrapper).
+// They are included below near the top of this header.
