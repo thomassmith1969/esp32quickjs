@@ -20,6 +20,9 @@ class ESP32QuickJS;
 #include "RotaryEncoder.h"
 #include "JSRotaryEncoder.h"
 
+#include "MotorDriver.h"
+#include "JSMotorDriver.h"
+
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -55,15 +58,12 @@ extern int currentTelnetId;
 #include <driver/spi_master.h>
 #include <SPI.h>  // for SPISettings, used as a convenience
 
-// JSServo uses ServoEasing.h, a high-level Arduino-ESP32 library that
-// runs on the LEDC peripheral via the stock Arduino Servo driver.
-// Non-blocking easing moves are handled by a timer ISR inside the
-// library, so the JS engine never blocks. Gated on the same auto-
-// enable as JSAnalog (GLOBAL_ESP32 by default). We include the .hpp
-// directly because that file contains both the class definition and
-// the inline implementations (it's a header-only library). The
-// accompanying .h is just a version-stub forwarder.
-#include <ServoEasing.hpp>
+// JSServo uses the ESP32 LEDC peripheral directly (50 Hz, 14-bit
+// resolution, 1000..2000 µs pulse range). No external Servo library
+// is needed — this keeps LEDC channel allocation centralized in
+// JSAnalog so analogWrite() and servo.attach() can never collide on
+// the same channel. Gated on the same auto-enable as JSAnalog
+// (GLOBAL_ESP32 by default).
 
 #include <LittleFS.h>
 #include <SD.h>
@@ -558,6 +558,8 @@ class JSTimer {
 // JSAnalog::loop() on the main task, where it's safe.
 // ----------------------------------------------------------------------------
 class JSAnalog {
+  friend class MotorDriver;
+  friend class JSServo;
   // -- readAnalog: queue of pending ADC reads --
   struct ReadEntry {
     uint8_t pin;
@@ -586,8 +588,39 @@ class JSAnalog {
   // to LEDC_CHANNELS-1.
   static const int LEDC_CHANNELS = 16;
   uint32_t channelBitmap = 0;  // bit i = channel i allocated
+  // Separate bitmap for channels reserved by servos (via ServoEasing).
+  // These channels are allocated by ESP32PWM independently, so we
+  // track them here to prevent JSAnalog::allocChannel() from
+  // handing them out to analogWrite().
+  uint32_t servoChannelBitmap = 0;
+
+  // Reserve a channel that was allocated by ServoEasing/ESP32PWM.
+  // Called from JSServo::loop() OP_ATTACH after successful attach().
+  void reserveServoChannel(uint8_t ch) {
+    if (ch >= 1 && ch < LEDC_CHANNELS) servoChannelBitmap |= (1U << ch);
+  }
+  // Allocate a fresh LEDC channel and mark it as servo-reserved.
+  // Returns the channel number (1..15) on success, or 0 if no
+  // channel is available. Called from JSServo::loop() OP_ATTACH.
+  uint8_t reserveServoChannel() {
+    int ch = allocChannel();
+    if (ch <= 0) return 0;
+    servoChannelBitmap |= (1U << ch);
+    return (uint8_t)ch;
+  }
+  // Release a servo-reserved channel. Called from JSServo::loop()
+  // OP_DETACH and JSServo::end().
+  void releaseServoChannel(uint8_t ch) {
+    if (ch >= 1 && ch < LEDC_CHANNELS) {
+      servoChannelBitmap &= ~(1U << ch);
+      channelBitmap &= ~(1U << ch);
+    }
+  }
+
   int allocChannel() {
     for (int i = 1; i < LEDC_CHANNELS; i++) {
+      // Skip channels reserved by servos.
+      if (servoChannelBitmap & (1U << i)) continue;
       if (!(channelBitmap & (1U << i))) {
         channelBitmap |= (1U << i);
         return i;
@@ -751,6 +784,17 @@ class JSAnalog {
         removeTouch(ctx, i);
       }
     }
+    // Free all allocated LEDC channels and detach pins.
+    for (int i = 0; i < 40; i++) {
+      uint8_t ch = pinChannel[i];
+      if (ch != PIN_UNUSED && ch != PIN_INVALID) {
+        ledcDetachPin((uint8_t)i);
+        freeChannel(ch);
+        pinChannel[i] = PIN_UNUSED;
+      }
+    }
+    // Also clear servo channel bitmap on full shutdown.
+    servoChannelBitmap = 0;
     // Free any in-flight read/write queues. Reject pending promises.
     for (auto& e : readQueue) {
       JSValue r = JS_UNDEFINED;
@@ -803,7 +847,13 @@ class JSAnalog {
         JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
         JS_FreeValue(ctx, r);
       } else {
-        int ch = allocChannel();
+        // Check if this pin already has a channel allocated - reuse it
+        // instead of allocating a new one. This prevents channel leaks
+        // when analogWrite() is called repeatedly on the same pin.
+        int ch = getPinChannel(e.pin);
+        if (ch == PIN_UNUSED || ch == PIN_INVALID) {
+          ch = allocChannel();
+        }
         if (ch >= 0) {
           // Setup the channel at the requested freq/resolution, then
           // attach the pin to it.
@@ -929,7 +979,7 @@ class JSAnalog {
 };
 
 // Static instance pointer for ISR → listener lookup.
-JSAnalog* JSAnalog::instance = nullptr;
+inline JSAnalog* JSAnalog::instance = nullptr;
 
 // Promise-based I2C bus wrapper.
 //
@@ -1372,7 +1422,7 @@ class JSI2C {
   std::vector<Bus> buses;
   std::vector<Entry> queue;
 };
-JSI2C* JSI2C::instance = nullptr;
+inline JSI2C* JSI2C::instance = nullptr;
 
 // Promise-based SPI bus wrapper.
 //
@@ -1799,7 +1849,7 @@ class JSSPI {
   std::vector<Device> devices;
   std::vector<Entry> queue;
 };
-JSSPI* JSSPI::instance = nullptr;
+inline JSSPI* JSSPI::instance = nullptr;
 
 // Promise-based hobby-servo driver backed by ServoEasing.h, a high-
 // level Arduino-ESP32 library that runs on the LEDC peripheral via
@@ -1809,10 +1859,13 @@ JSSPI* JSSPI::instance = nullptr;
 // JS trampolines just push a record onto a queue and return a
 // Promise that resolves on the next loop tick.
 //
-// Important: ServoEasing uses LEDC channels internally (it inherits
-// from Arduino's Servo, which calls ledcAttachPin / ledcWrite on
-// attach). This means it CAN share the LEDC pool with JSAnalog —
-// the same pin cannot be both an LEDC PWM output and a servo at
+// JSServo drives hobby servos directly via the ESP32 LEDC peripheral
+// (50 Hz, 14-bit resolution, 1000..2000 µs pulse range). It does NOT
+// use ServoEasing or any external Servo library — channel allocation
+// goes through JSAnalog::reserveServoChannel() so analogWrite() and
+// servo.attach() can never collide on the same LEDC channel.
+//
+// Important: a pin cannot be both an LEDC PWM output and a servo at
 // the same time. The pin-busy checks in js_attach / digitalRead /
 // analogRead protect against that: if JSAnalog is already driving
 // the pin, attach() refuses.
@@ -1823,9 +1876,9 @@ JSSPI* JSSPI::instance = nullptr;
 //   await servo.writeUs(s, 1500);     // raw microseconds
 //   await servo.detach(s);            // stop pulses, free the slot
 //
-// ESP32Servo (the ServoEasing base) supports up to 16 servos on most
-// cores (16 LEDC channels); we cap at 8 to keep the slot table
-// small.
+// We cap at 8 simultaneous servos to keep the slot table small.
+// LEDC has 16 channels (0..15); channel 0 is reserved for Tone by
+// JSAnalog, so 15 channels are available for analog + servos.
 class JSServo {
  public:
   static constexpr const char* TAG = "JSServo";
@@ -1836,7 +1889,8 @@ class JSServo {
   struct Servo {
     bool active = false;
     uint8_t pin = 0xFF;
-    ServoEasing* driver = nullptr;  // owned; we delete in detach()
+    uint8_t channel = 0;            // LEDC channel reserved via JSAnalog
+    uint16_t currentUs = 1500;      // last pulse width written (for diagnostics)
   };
 
   // Queue entry. attach() binds a new pin, write()/writeUs() update
@@ -1855,19 +1909,27 @@ class JSServo {
   // Pointer to the JSAnalog member of the parent ESP32QuickJS, set
   // by ESP32QuickJS::begin() after both are constructed. Used by
   // js_attach to refuse if LEDC is already driving the requested
-  // pin (the ServoEasing library uses LEDC internally, so a pin
-  // can't be both a PWM output and a servo).
+  // pin (a pin can't be both a PWM output and a servo), and by
+  // OP_ATTACH/OP_DETACH to reserve/release LEDC channels through
+  // the centralized allocator.
   JSAnalog* analog = nullptr;
 
  private:
-  static const int JS_SERVO_MAX = 8;  // local slot count; renamed to avoid
-                                       // clash with ESP32Servo's MAX_SERVOS macro
+  static const int JS_SERVO_MAX = 8;  // local slot count
 
   // Standard hobby-servo pulse range. 1000 µs = 0°, 1500 µs = center,
   // 2000 µs = 180°. We clamp writes to this range; values outside
   // can damage cheap servos.
   static constexpr uint16_t SERVO_MIN_US = 1000;
   static constexpr uint16_t SERVO_MAX_US = 2000;
+
+  // LEDC configuration for hobby servos. 50 Hz is the standard
+  // refresh rate; 14-bit resolution gives ~16384 steps per period,
+  // which is plenty of precision for 1000..2000 µs pulses (each µs
+  // is ~3.3 counts at 14-bit/50 Hz).
+  static constexpr uint32_t SERVO_FREQ_HZ = 50;
+  static constexpr uint8_t  SERVO_RES_BITS = 14;
+  static constexpr uint32_t SERVO_MAX_DUTY = (1u << SERVO_RES_BITS);  // 16384
 
   Servo servos[JS_SERVO_MAX];
   std::vector<Entry> queue;
@@ -1887,18 +1949,30 @@ class JSServo {
                       (uint32_t)deg * (SERVO_MAX_US - SERVO_MIN_US) / 180);
   }
 
+  // Convert microseconds (1000..2000) to a 14-bit LEDC duty count
+  // at 50 Hz. Period = 1/50 = 20 ms = 20000 µs. With 14-bit
+  // resolution, 20000 µs maps to 16384 counts, so 1 µs ≈ 0.8192
+  // counts. We round to nearest integer.
+  static uint32_t usToDuty(uint16_t us) {
+    // duty = us * (SERVO_MAX_DUTY / 20000)
+    //       = us * 16384 / 20000
+    // Use 64-bit to avoid overflow on the intermediate.
+    return (uint32_t)(((uint64_t)us * SERVO_MAX_DUTY) / 20000ULL);
+  }
+
  public:
   JSServo() = default;
 
   // Wire the static instance and reset state. Called once from
   // ESP32QuickJS::begin(). No hardware to allocate up front — each
-  // ServoEasing is created on demand when the user calls attach().
+  // LEDC channel is reserved on demand when the user calls attach().
   void init() {
     instance = this;
     for (int i = 0; i < JS_SERVO_MAX; i++) {
       servos[i].active = false;
       servos[i].pin = 0xFF;
-      servos[i].driver = nullptr;
+      servos[i].channel = 0;
+      servos[i].currentUs = 1500;
     }
   }
 
@@ -1914,61 +1988,77 @@ class JSServo {
       JS_FreeValue(ctx, err);
     } else if (e.kind == Entry::OP_ATTACH) {
       Servo& s = servos[e.servo_idx];
-      // Create the ServoEasing on demand. The library extends the
-      // stock Arduino Servo class, so this is cheap (~32 bytes of
-      // state). attach() returns the LEDC channel allocated by the
-      // library, or 0/255 on failure.
-      if (!s.driver) s.driver = new ServoEasing();
-      uint16_t us = (uint16_t)e.value;
-      if (us < SERVO_MIN_US) us = SERVO_MIN_US;
-      if (us > SERVO_MAX_US) us = SERVO_MAX_US;
-      uint8_t rc = s.driver->attach((int)s.pin, (int)us);
-      if (rc == 0 || rc == 255) {
-        // attach failed. Free the driver and reject.
-        delete s.driver;
-        s.driver = nullptr;
+      // Reserve an LEDC channel through JSAnalog's centralized
+      // allocator. This skips channels already used by analogWrite()
+      // and channels reserved by other servos, so we never collide
+      // with the PWM pool.
+      uint8_t ch = analog ? analog->reserveServoChannel() : 0;
+      if (ch == 0) {
         JSValue err = JS_NewString(ctx,
-          "JSServo.attach: ServoEasing::attach failed (no free LEDC channel?)");
+          "JSServo.attach: no free LEDC channel (all 15 in use?)");
         JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
         JS_FreeValue(ctx, err);
       } else {
-        s.active = true;
-        JSValue v = JS_NewInt32(ctx, e.servo_idx);
-        JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &v);
-        JS_FreeValue(ctx, v);
+        // Configure LEDC for 50 Hz / 14-bit and attach the pin.
+        // ledcSetup returns the actual frequency (should be 50 Hz)
+        // or 0 on failure. We treat 0 as failure and release the
+        // reservation.
+        uint32_t actualFreq = ledcSetup(ch, SERVO_FREQ_HZ, SERVO_RES_BITS);
+        if (actualFreq == 0) {
+          if (analog) analog->releaseServoChannel(ch);
+          JSValue err = JS_NewString(ctx,
+            "JSServo.attach: ledcSetup failed");
+          JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
+          JS_FreeValue(ctx, err);
+        } else {
+          ledcAttachPin((int)s.pin, ch);
+          s.active = true;
+          s.channel = ch;
+          // Apply the requested initial pulse (clamped to safe range).
+          uint16_t us = (uint16_t)e.value;
+          if (us < SERVO_MIN_US) us = SERVO_MIN_US;
+          if (us > SERVO_MAX_US) us = SERVO_MAX_US;
+          s.currentUs = us;
+          ledcWrite(ch, usToDuty(us));
+          JSValue v = JS_NewInt32(ctx, e.servo_idx);
+          JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &v);
+          JS_FreeValue(ctx, v);
+        }
       }
     } else if (e.kind == Entry::OP_WRITE_DEG || e.kind == Entry::OP_WRITE_US) {
       Servo& s = servos[e.servo_idx];
-      if (!s.active || !s.driver) {
+      if (!s.active) {
         JSValue err = JS_NewString(ctx, "JSServo: servo not attached");
         JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
         JS_FreeValue(ctx, err);
       } else {
-        int v = e.value;
+        uint16_t us;
         if (e.kind == Entry::OP_WRITE_DEG) {
-          // ServoEasing::write(value<=360) treats the value as
-          // degrees, >360 as microseconds. Our values are always
-          // 0..180 or 1000..2000, so we pass either degrees or
-          // microseconds directly.
-          s.driver->write(v);
+          us = degreesToUs(e.value);
         } else {
+          int v = e.value;
           if (v < SERVO_MIN_US) v = SERVO_MIN_US;
           if (v > SERVO_MAX_US) v = SERVO_MAX_US;
-          s.driver->write(v);
+          us = (uint16_t)v;
         }
+        s.currentUs = us;
+        ledcWrite(s.channel, usToDuty(us));
         JSValue r = JS_UNDEFINED;
         JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
         JS_FreeValue(ctx, r);
       }
     } else {  // OP_DETACH
       Servo& s = servos[e.servo_idx];
-      if (s.active && s.driver) {
-        s.driver->detach();
-        delete s.driver;
-        s.driver = nullptr;
+      if (s.active) {
+        // Detach the pin from LEDC and release the channel back to
+        // the JSAnalog pool so analogWrite() can reuse it.
+        ledcDetachPin((int)s.pin);
+        if (s.channel && analog) analog->releaseServoChannel(s.channel);
       }
       s.active = false;
       s.pin = 0xFF;
+      s.channel = 0;
+      s.currentUs = 1500;
       JSValue r = JS_UNDEFINED;
       JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
       JS_FreeValue(ctx, r);
@@ -1979,13 +2069,14 @@ class JSServo {
 
   void end(JSContext* ctx) {
     for (int i = 1; i < JS_SERVO_MAX; i++) {
-      if (servos[i].driver) {
-        if (servos[i].active) servos[i].driver->detach();
-        delete servos[i].driver;
-        servos[i].driver = nullptr;
+      if (servos[i].active) {
+        ledcDetachPin((int)servos[i].pin);
+        if (servos[i].channel && analog) analog->releaseServoChannel(servos[i].channel);
       }
       servos[i].active = false;
       servos[i].pin = 0xFF;
+      servos[i].channel = 0;
+      servos[i].currentUs = 1500;
     }
     for (auto& e : queue) {
       JSValue r = JS_UNDEFINED;
@@ -2126,7 +2217,7 @@ class JSServo {
     return promise;
   }
 };
-JSServo* JSServo::instance = nullptr;
+inline JSServo* JSServo::instance = nullptr;
 
 // Generic Promise-style filesystem backend. Works with any Arduino FS (LittleFS, SD, ...).
 // Mirrors the JSHttpFetcher style: queue entries, poll from ESP32QuickJS::loop().
@@ -2640,7 +2731,7 @@ class JSEspNow {
     }
   }
 };
-JSEspNow *JSEspNow::instance = nullptr;
+inline JSEspNow *JSEspNow::instance = nullptr;
 
 class ESP32QuickJS {
  public:
@@ -2663,6 +2754,7 @@ class ESP32QuickJS {
   JSSPI spi;
   JSServo servo;
   JSEspNow espNow;
+  JSMotorDriver motorDriver;
 
   void begin() {
     JSRuntime *rt = JS_NewRuntime();
@@ -2700,6 +2792,8 @@ class ESP32QuickJS {
     JSServo::instance = &servo;
     servo.analog = &analog;  // let servo.attach reject pins LEDC owns
     servo.init();
+    motorDriver.analog = &analog;  // share LEDC allocator with analogWrite
+    motorDriver.init();
     // Wire the static trampoline so C callbacks can find this instance.
     JSEspNow::instance = &espNow;
     espNow.ctx = ctx;
@@ -2752,6 +2846,7 @@ class ESP32QuickJS {
     spi.loop(ctx);
     servo.loop(ctx);
     espNow.loop();
+    motorDriver.loop(ctx);
 
     // loop()
     if (callLoopFn && JS_IsFunction(ctx, loop_func)) {
@@ -2912,6 +3007,7 @@ class ESP32QuickJS {
       qjs_->spi.loop(ctx_);
       qjs_->servo.loop(ctx_);
       qjs_->espNow.loop();
+      qjs_->motorDriver.loop(ctx_);
 
       // Pump telnet/serial input so other sessions don't freeze.
       if (pumpCallback) pumpCallback();
@@ -4024,6 +4120,36 @@ class ESP32QuickJS {
       JS_SetClassProto(ctx, JSRotaryEncoder::js_class_id, proto);
 
       JS_SetPropertyStr(ctx, global, "RotaryEncoder", ctor);
+    }
+
+    {
+      // Register the MotorDriver class. Same pattern as RotaryEncoder.
+      JSRuntime *rt = JS_GetRuntime(ctx);
+      JS_NewClassID(&JSMotorDriver::js_class_id);
+      JS_NewClass(rt, JSMotorDriver::js_class_id,
+                  &JSMotorDriver::js_class_def);
+
+      JSValue proto = JS_NewObject(ctx);
+      JS_SetPropertyStr(
+          ctx, proto, "speed",
+          JS_NewCFunction(ctx, JSMotorDriver::js_speed, "speed", 1));
+      JS_SetPropertyStr(
+          ctx, proto, "position",
+          JS_NewCFunction(ctx, JSMotorDriver::js_position, "position", 0));
+      JS_SetPropertyStr(
+          ctx, proto, "moveTo",
+          JS_NewCFunction(ctx, JSMotorDriver::js_moveTo, "moveTo", 2));
+      JS_SetPropertyStr(
+          ctx, proto, "stop",
+          JS_NewCFunction(ctx, JSMotorDriver::js_stop, "stop", 0));
+
+      JSValue ctor = JS_NewCFunction2(ctx, JSMotorDriver::js_ctor,
+                                      "MotorDriver", 4,
+                                      JS_CFUNC_constructor, 0);
+      JS_SetConstructor(ctx, ctor, proto);
+      JS_SetClassProto(ctx, JSMotorDriver::js_class_id, proto);
+
+      JS_SetPropertyStr(ctx, global, "MotorDriver", ctor);
     }
 
 #ifndef GLOBAL_ESP32

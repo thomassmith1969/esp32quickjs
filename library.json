@@ -19,6 +19,15 @@
   "version": "0.0.1",
   "framework": "*",
   "platforms": "espressif32",
+  "dependencies": {
+    "madhephaestus/ESP32Servo": "^3.2.1",
+    "ServoEasing": "^3.6.0",
+    "LittleFS": "^3.3.10",
+    "SD": "^3.3.10",
+    "Ticker": "^3.3.10",
+    "madhephaestus/ESP32Encoder": "^0.12.0",
+    "hideakitai/ESP32SPISlave": "^0.8.0"
+  },
   "build": {
     "flags": "-DCONFIG_VERSION=\\\"2020-11-08\\\"",
     "srcFilter": [
