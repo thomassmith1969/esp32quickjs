@@ -2686,28 +2686,127 @@ class JSFileSystem {
     std::string path;
     std::string content;  // used for OP_WRITE
     JSValue resolving_funcs[2];
-    bool done = false;
-    bool ok = false;
+    // Result (filled by task, read by loop):
+    volatile bool done;
+    volatile bool ok;
     std::string result;  // read content or list text
     std::string error;   // error message on failure
   };
 
  private:
-  std::vector<Entry *> queue;
+  std::vector<Entry *> queue;       // pending entries (task pops from here)
+  std::vector<Entry *> doneQueue_;  // completed entries (loop pops from here)
   fs::FS *defaultFs = nullptr;
+  TaskHandle_t task_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
+  SemaphoreHandle_t notify_ = nullptr;
+  volatile bool stopping_ = false;
 
-  static void finish(Entry *e, JSContext *ctx) {
-    if (e->ok) {
-      JSValue val = JS_NewString(ctx, e->result.c_str());
-      JS_Call(ctx, e->resolving_funcs[0], JS_UNDEFINED, 1, &val);
-      JS_FreeValue(ctx, val);
-    } else {
-      JSValue err = JS_NewString(ctx, e->error.c_str());
-      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
+  static void taskEntry(void *arg) {
+    static_cast<JSFileSystem *>(arg)->workerTask();
+    vTaskDelete(nullptr);
+  }
+
+  void workerTask() {
+    while (true) {
+      xSemaphoreTake(notify_, portMAX_DELAY);
+      if (stopping_) break;
+
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      if (queue.empty()) { xSemaphoreGive(mutex_); continue; }
+      Entry *e = queue.front();
+      queue.erase(queue.begin());
+      xSemaphoreGive(mutex_);
+
+      processEntry(e);
+
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
     }
-    JS_FreeValue(ctx, e->resolving_funcs[0]);
-    JS_FreeValue(ctx, e->resolving_funcs[1]);
+  }
+
+  void processEntry(Entry *e) {
+    e->ok = false;
+    if (!e->fs) {
+      e->error = "filesystem unbound";
+      e->done = true;
+      return;
+    }
+    switch (e->op) {
+      case OP_READ: {
+        if (!e->fs->exists(e->path.c_str())) {
+          e->error = "ENOENT: " + e->path;
+          break;
+        }
+        File f = e->fs->open(e->path.c_str(), "r");
+        if (!f) {
+          e->error = "EOPEN: " + e->path;
+          break;
+        }
+        std::string out;
+        const size_t CHUNK = 512;
+        uint8_t buf[CHUNK];
+        while (f.available()) {
+          size_t n = f.read(buf, CHUNK);
+          if (!n) break;
+          out.append((const char *)buf, n);
+        }
+        f.close();
+        e->ok = true;
+        e->result = std::move(out);
+        break;
+      }
+      case OP_WRITE: {
+        File f = e->fs->open(e->path.c_str(), "w");
+        if (!f) {
+          e->error = "EOPEN: " + e->path;
+          break;
+        }
+        size_t written = f.print(e->content.c_str());
+        f.close();
+        if (written != e->content.size()) {
+          e->error = "ESHORT: " + e->path;
+          break;
+        }
+        e->ok = true;
+        e->result = "wrote " + std::to_string(written) + " bytes";
+        break;
+      }
+      case OP_REMOVE: {
+        if (!e->fs->exists(e->path.c_str())) {
+          e->error = "ENOENT: " + e->path;
+          break;
+        }
+        if (!e->fs->remove(e->path.c_str())) {
+          e->error = "EUNLINK: " + e->path;
+          break;
+        }
+        e->ok = true;
+        e->result = "removed " + e->path;
+        break;
+      }
+      case OP_LIST: {
+        std::string listing;
+        File root = e->fs->open(e->path.c_str(), "r");
+        if (!root || !root.isDirectory()) {
+          if (root) root.close();
+          e->error = "ENOTDIR: " + e->path;
+          break;
+        }
+        File entry = root.openNextFile();
+        while (entry) {
+          listing += entry.name();
+          listing += "\n";
+          entry.close();
+          entry = root.openNextFile();
+        }
+        root.close();
+        e->ok = true;
+        e->result = std::move(listing);
+        break;
+      }
+    }
     e->done = true;
   }
 
@@ -2715,6 +2814,14 @@ class JSFileSystem {
   // Bind a backing fs::FS (LittleFS, SD, ...). Use nullptr to detach.
   void bind(fs::FS *fs) { defaultFs = fs; }
   fs::FS *bound() const { return defaultFs; }
+
+  void init() {
+    if (task_) return;
+    mutex_ = xSemaphoreCreateMutex();
+    notify_ = xSemaphoreCreateBinary();
+    // 4KB stack — file I/O doesn't need much.
+    xTaskCreatePinnedToCore(taskEntry, "js_fs", 4096, this, 1, &task_, 0);
+  }
 
   JSValue op(JSContext *ctx, Op op_, const char *path, const char *content) {
     if (!defaultFs) {
@@ -2732,135 +2839,56 @@ class JSFileSystem {
     e->fs = defaultFs;
     e->path = path ? path : "";
     if (content) e->content = content;
+    e->done = false;
+    e->ok = false;
     JSValue promise = JS_NewPromiseCapability(ctx, e->resolving_funcs);
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
     queue.push_back(e);
+    xSemaphoreGive(mutex_);
+    xSemaphoreGive(notify_);
+
     return promise;
   }
 
-  // Process at most one entry per loop tick. Returns true if work was done.
-  // Processing one at a time keeps flash wear / SD latency bounded.
+  // Called from the main loop. Resolves/rejects Promises for completed
+  // entries. Never blocks.
   void loop(JSContext *ctx) {
-    for (auto &pent : queue) {
-      if (pent->done) continue;
-      if (!pent->fs) {
-        pent->ok = false;
-        pent->error = "filesystem unbound";
-        finish(pent, ctx);
-        continue;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    std::vector<Entry *> done;
+    done.swap(doneQueue_);
+    xSemaphoreGive(mutex_);
+
+    for (Entry *e : done) {
+      if (e->ok) {
+        JSValue val = JS_NewString(ctx, e->result.c_str());
+        JS_Call(ctx, e->resolving_funcs[0], JS_UNDEFINED, 1, &val);
+        JS_FreeValue(ctx, val);
+      } else {
+        JSValue err = JS_NewString(ctx, e->error.c_str());
+        JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &err);
+        JS_FreeValue(ctx, err);
       }
-      switch (pent->op) {
-        case OP_READ: {
-          if (!pent->fs->exists(pent->path.c_str())) {
-            pent->ok = false;
-            pent->error = "ENOENT: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          File f = pent->fs->open(pent->path.c_str(), "r");
-          if (!f) {
-            pent->ok = false;
-            pent->error = "EOPEN: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          std::string out;
-          // Chunk into a temporary buffer; for very large files users can
-          // chunked APIs (planned extension).
-          const size_t CHUNK = 256;
-          uint8_t buf[CHUNK];
-          while (f.available()) {
-            size_t n = f.read(buf, CHUNK);
-            if (!n) break;
-            out.append((const char *)buf, n);
-          }
-          f.close();
-          pent->ok = true;
-          pent->result = std::move(out);
-          finish(pent, ctx);
-          break;
-        }
-        case OP_WRITE: {
-          // Ensure parent directory exists for LittleFS; SD auto-creates.
-          File f = pent->fs->open(pent->path.c_str(), "w");
-          if (!f) {
-            pent->ok = false;
-            pent->error = "EOPEN: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          size_t written = f.print(pent->content.c_str());
-          f.close();
-          if (written != pent->content.size()) {
-            pent->ok = false;
-            pent->error = "ESHORT: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          pent->ok = true;
-          pent->result = "wrote " + std::to_string(written) + " bytes";
-          finish(pent, ctx);
-          break;
-        }
-        case OP_REMOVE: {
-          if (!pent->fs->exists(pent->path.c_str())) {
-            pent->ok = false;
-            pent->error = "ENOENT: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          if (!pent->fs->remove(pent->path.c_str())) {
-            pent->ok = false;
-            pent->error = "Erm: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          pent->ok = true;
-          pent->result = "removed " + pent->path;
-          finish(pent, ctx);
-          break;
-        }
-        case OP_LIST: {
-          const char *dir = pent->path.empty() ? "/" : pent->path.c_str();
-          File root = pent->fs->open(dir);
-          if (!root || !root.isDirectory()) {
-            pent->ok = false;
-            pent->error = "ENOTDIR: " + pent->path;
-            finish(pent, ctx);
-            break;
-          }
-          std::string out;
-          File entry = root.openNextFile();
-          while (entry) {
-            if (entry.isDirectory()) {
-              out += "/";
-              out += entry.name();
-            } else {
-              out += entry.name();
-              out += "\t";
-              out += std::to_string(entry.size());
-            }
-            out += "\n";
-            entry.close();
-            entry = root.openNextFile();
-          }
-          root.close();
-          pent->ok = true;
-          pent->result = std::move(out);
-          finish(pent, ctx);
-          break;
-        }
-      }
+      JS_FreeValue(ctx, e->resolving_funcs[0]);
+      JS_FreeValue(ctx, e->resolving_funcs[1]);
+      delete e;
     }
-    // Drop completed entries.
-    queue.erase(std::remove_if(queue.begin(), queue.end(),
-                               [](Entry *e) {
-                                 if (e->done) {
-                                   delete e;
-                                   return true;
-                                 }
-                                 return false;
-                               }),
-                queue.end());
+  }
+
+  void end() {
+    stopping_ = true;
+    if (notify_) xSemaphoreGive(notify_);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (task_) { vTaskDelete(task_); task_ = nullptr; }
+    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
+    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
+    // Note: we can't free JSValues here because we don't have ctx.
+    // Pending entries are abandoned; their Promises will never settle.
+    // This is only called during shutdown, so it's acceptable.
+    for (auto *e : queue) delete e;
+    queue.clear();
+    for (auto *e : doneQueue_) delete e;
+    doneQueue_.clear();
   }
 };
 
@@ -3243,6 +3271,10 @@ class ESP32QuickJS {
     JSSPI::instance = &spi;
     i2c.init();
     spi.init();
+    // Initialize the non-blocking filesystem tasks (LittleFS + SD share
+    // the same JSFileSystem class, each gets its own task).
+    littlefs.init();
+    sd.init();
     JSServo::instance = &servo;
     servo.analog = &analog;  // let servo.attach reject pins LEDC owns
     servo.init();
