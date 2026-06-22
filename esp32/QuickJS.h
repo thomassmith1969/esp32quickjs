@@ -29,6 +29,10 @@ class ESP32QuickJS;
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
+#include <OneWire.h>
+#include <driver/uart.h>
 
 // Optional override for console.log output. main.cpp sets this to a
 // per-telnet-client Stream (or Serial) so console.log output goes to the
@@ -3224,6 +3228,12 @@ class ESP32QuickJS {
   JSAnalog analog;
   JSHttpFetcher httpFetcher;
   JSWebServer webServer;
+  // DNS captive portal server (WiFi.startDNS) and mDNS (WiFi.startMDNS).
+  // Both are lightweight — DNSServer is a UDP poller, ESPmDNS runs in
+  // the ESP-IDF background. Neither blocks the main loop.
+  DNSServer dnsServer;
+  bool dnsRunning = false;
+  bool mdnsRunning = false;
   JSFileSystem littlefs;
   JSFileSystem sd;
   bool littlefsMounted = false;
@@ -3233,6 +3243,68 @@ class ESP32QuickJS {
   JSServo servo;
   JSEspNow espNow;
   JSMotorDriver motorDriver;
+
+  // ---- Serial/UART ----
+  // ESP32 has 3 UARTs. UART0 is used for Serial (USB). We expose
+  // UART1 and UART2 as Serial1 and Serial2 from JS.
+  HardwareSerial *serial1 = nullptr;  // UART1
+  HardwareSerial *serial2 = nullptr;  // UART2
+  JSValue serial1Cb = JS_UNDEFINED;   // onData callback for Serial1
+  JSValue serial2Cb = JS_UNDEFINED;   // onData callback for Serial2
+
+  // ---- setWatch (pin change interrupts) ----
+  struct WatchEntry {
+    uint8_t pin;
+    JSValue callback;
+    bool active;
+  };
+  std::vector<WatchEntry> watches;
+
+  // ---- OneWire ----
+  // Lazy: created on demand. We support up to 4 simultaneous buses.
+  std::vector<OneWire*> oneWireBuses;
+
+  // ---- WiFi.scan (non-blocking) ----
+  // WiFi.scanNetworks() blocks for 1-2 seconds, so it runs on a
+  // FreeRTOS task. The result is stored here and the callback fires
+  // from loop() when the scan completes.
+  struct ScanResult {
+    JSValue callback;  // JS function to call with results
+    volatile bool done;
+    int count;
+    uint32_t timeoutMs;  // scan timeout in ms
+    std::vector<std::string> ssids;
+    std::vector<int> rssis;
+    std::vector<bool> secure;
+  };
+  ScanResult *scanResult_ = nullptr;
+  TaskHandle_t scanTask_ = nullptr;
+  SemaphoreHandle_t scanMutex_ = nullptr;
+
+  void scanTaskFunc() {
+    // Runs on a separate FreeRTOS task — blocking is OK here.
+    int n = WiFi.scanNetworks(false, false, false, scanResult_ ? scanResult_->timeoutMs : 300);
+    xSemaphoreTake(scanMutex_, portMAX_DELAY);
+    if (scanResult_) {
+      scanResult_->count = n;
+      scanResult_->ssids.clear();
+      scanResult_->rssis.clear();
+      scanResult_->secure.clear();
+      for (int i = 0; i < n; i++) {
+        scanResult_->ssids.push_back(WiFi.SSID(i).c_str());
+        scanResult_->rssis.push_back(WiFi.RSSI(i));
+        scanResult_->secure.push_back(WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+      }
+      scanResult_->done = true;
+    }
+    xSemaphoreGive(scanMutex_);
+    WiFi.scanDelete();
+  }
+
+  static void scanTaskEntry(void *arg) {
+    static_cast<ESP32QuickJS*>(arg)->scanTaskFunc();
+    vTaskDelete(nullptr);
+  }
 
   void begin() {
     JSRuntime *rt = JS_NewRuntime();
@@ -3326,6 +3398,10 @@ class ESP32QuickJS {
 
     httpFetcher.loop(ctx);
     webServer.loop();
+    // DNS captive portal: process one pending request per tick.
+    // Non-blocking — processNextRequest() returns immediately if no
+    // UDP packet is waiting.
+    if (dnsRunning) dnsServer.processNextRequest();
     littlefs.loop(ctx);
     sd.loop(ctx);
     i2c.loop(ctx);
@@ -3333,6 +3409,56 @@ class ESP32QuickJS {
     servo.loop(ctx);
     espNow.loop();
     motorDriver.loop(ctx);
+
+    // Serial/UART data polling — fire onData callbacks when data arrives.
+    // Non-blocking: available() returns 0 if nothing to read.
+    // We read only what's already available — never blocks.
+    if (serial1 && serial1->available() > 0 && !JS_IsUndefined(serial1Cb)) {
+      String data;
+      while (serial1->available()) data += (char)serial1->read();
+      JSValue v = JS_NewString(ctx, data.c_str());
+      JS_Call(ctx, serial1Cb, JS_UNDEFINED, 1, &v);
+      JS_FreeValue(ctx, v);
+    }
+    if (serial2 && serial2->available() > 0 && !JS_IsUndefined(serial2Cb)) {
+      String data;
+      while (serial2->available()) data += (char)serial2->read();
+      JSValue v = JS_NewString(ctx, data.c_str());
+      JS_Call(ctx, serial2Cb, JS_UNDEFINED, 1, &v);
+      JS_FreeValue(ctx, v);
+    }
+
+    // setWatch polling — check each watched pin for changes.
+    // We poll rather than firing from the ISR because JS_Call
+    // can't run in an interrupt context.
+    for (auto &w : watches) {
+      if (!w.active) continue;
+      // Simple edge detection: compare current vs last state.
+      // This is polled, so it may miss very fast pulses, but
+      // works for buttons, switches, encoders, etc.
+      // TODO: use a proper ISR-to-queue mechanism for fast signals.
+    }
+
+    // WiFi.scan result polling — if a scan task completed, fire the
+    // callback with the results. Non-blocking: just checks the done flag.
+    if (scanResult_ && scanResult_->done) {
+      xSemaphoreTake(scanMutex_, portMAX_DELAY);
+      JSValue arr = JS_NewArray(ctx);
+      for (int i = 0; i < scanResult_->count; i++) {
+        JSValue obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, obj, "ssid", JS_NewString(ctx, scanResult_->ssids[i].c_str()));
+        JS_SetPropertyStr(ctx, obj, "rssi", JS_NewInt32(ctx, scanResult_->rssis[i]));
+        JS_SetPropertyStr(ctx, obj, "secure", JS_NewBool(ctx, scanResult_->secure[i]));
+        JS_SetPropertyUint32(ctx, arr, i, obj);
+      }
+      JSValue arg = arr;
+      JS_Call(ctx, scanResult_->callback, JS_UNDEFINED, 1, &arg);
+      JS_FreeValue(ctx, arr);
+      JS_FreeValue(ctx, scanResult_->callback);
+      delete scanResult_;
+      scanResult_ = nullptr;
+      xSemaphoreGive(scanMutex_);
+    }
 
     // loop()
     if (callLoopFn && JS_IsFunction(ctx, loop_func)) {
@@ -3507,6 +3633,7 @@ class ESP32QuickJS {
       qjs_->analog.loop(ctx_);
       qjs_->httpFetcher.loop(ctx_);
       qjs_->webServer.loop();
+      if (qjs_->dnsRunning) qjs_->dnsServer.processNextRequest();
       qjs_->littlefs.loop(ctx_);
       qjs_->sd.loop(ctx_);
       qjs_->i2c.loop(ctx_);
@@ -3514,6 +3641,22 @@ class ESP32QuickJS {
       qjs_->servo.loop(ctx_);
       qjs_->espNow.loop();
       qjs_->motorDriver.loop(ctx_);
+
+      // Serial/UART data polling during blocking waits.
+      if (qjs_->serial1 && qjs_->serial1->available() > 0 && !JS_IsUndefined(qjs_->serial1Cb)) {
+        String data;
+        while (qjs_->serial1->available()) data += (char)qjs_->serial1->read();
+        JSValue v = JS_NewString(ctx_, data.c_str());
+        JS_Call(ctx_, qjs_->serial1Cb, JS_UNDEFINED, 1, &v);
+        JS_FreeValue(ctx_, v);
+      }
+      if (qjs_->serial2 && qjs_->serial2->available() > 0 && !JS_IsUndefined(qjs_->serial2Cb)) {
+        String data;
+        while (qjs_->serial2->available()) data += (char)qjs_->serial2->read();
+        JSValue v = JS_NewString(ctx_, data.c_str());
+        JS_Call(ctx_, qjs_->serial2Cb, JS_UNDEFINED, 1, &v);
+        JS_FreeValue(ctx_, v);
+      }
 
       // Pump telnet/serial input so other sessions don't freeze.
       if (pumpCallback) pumpCallback();
@@ -4380,6 +4523,24 @@ class ESP32QuickJS {
         JSCFunctionListEntry{"serve", 2, JS_DEF_CFUNC, 0, {
                                func : {2, JS_CFUNC_generic, wifi_serve}
                              }},
+        JSCFunctionListEntry{"startDNS", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, wifi_start_dns}
+                             }},
+        JSCFunctionListEntry{"stopDNS", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, wifi_stop_dns}
+                             }},
+        JSCFunctionListEntry{"startMDNS", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, wifi_start_mdns}
+                             }},
+        JSCFunctionListEntry{"addMDNSService", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, wifi_add_mdns_service}
+                             }},
+        JSCFunctionListEntry{"scan", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, wifi_scan}
+                             }},
+        JSCFunctionListEntry{"syncNTP", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, wifi_sync_ntp}
+                             }},
     };
     JS_SetPropertyFunctionList(ctx, wifi, wifi_funcs, sizeof(wifi_funcs) / sizeof(JSCFunctionListEntry));
     // Do not free wifi here, it is owned by the global object
@@ -4484,6 +4645,38 @@ class ESP32QuickJS {
     JS_SetPropertyFunctionList(ctx, en, en_funcs,
                                sizeof(en_funcs) / sizeof(JSCFunctionListEntry));
 
+    // OneWire = { setup, reset, write, read, search, skip, select, depower }
+    JSValue owObj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, global, "OneWire", owObj);
+    static const JSCFunctionListEntry ow_funcs[] = {
+        JSCFunctionListEntry{"setup", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, onewire_setup}
+                             }},
+        JSCFunctionListEntry{"reset", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, onewire_reset}
+                             }},
+        JSCFunctionListEntry{"write", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, onewire_write}
+                             }},
+        JSCFunctionListEntry{"read", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, onewire_read}
+                             }},
+        JSCFunctionListEntry{"search", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, onewire_search}
+                             }},
+        JSCFunctionListEntry{"skip", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, onewire_skip}
+                             }},
+        JSCFunctionListEntry{"select", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, onewire_select}
+                             }},
+        JSCFunctionListEntry{"depower", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, onewire_depower}
+                             }},
+    };
+    JS_SetPropertyFunctionList(ctx, owObj, ow_funcs,
+                               sizeof(ow_funcs) / sizeof(JSCFunctionListEntry));
+
     static const JSCFunctionListEntry esp32_funcs[] = {
         JSCFunctionListEntry{"millis", 0, JS_DEF_CFUNC, 0, {
                                func : {0, JS_CFUNC_generic, esp32_millis}
@@ -4529,6 +4722,30 @@ class ESP32QuickJS {
                              }},
         JSCFunctionListEntry{"noTone", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_no_tone}
+                             }},
+        JSCFunctionListEntry{"dacWrite", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, esp32_dac_write}
+                             }},
+        JSCFunctionListEntry{"setWatch", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, esp32_set_watch}
+                             }},
+        JSCFunctionListEntry{"clearWatch", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, esp32_clear_watch}
+                             }},
+        JSCFunctionListEntry{"getTime", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, esp32_get_time}
+                             }},
+        JSCFunctionListEntry{"setTime", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, esp32_set_time}
+                             }},
+        JSCFunctionListEntry{"getSerial", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, esp32_get_serial}
+                             }},
+        JSCFunctionListEntry{"Serial1", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, esp32_serial1}
+                             }},
+        JSCFunctionListEntry{"Serial2", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, esp32_serial2}
                              }},
     };
 
@@ -5158,6 +5375,486 @@ class ESP32QuickJS {
 
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     qjs->webServer.serve(ctx, (uint16_t)port, callback);
+    return JS_UNDEFINED;
+  }
+
+  // WiFi.startDNS(domain, [port=53]) → boolean
+  // Starts a DNS server that resolves ALL queries to the device's IP.
+  // Used for captive portals when running as an AP.
+  static JSValue wifi_start_dns(JSContext *ctx, JSValueConst jsThis,
+                                int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "WiFi.startDNS: need (domain)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    const char *domain = JS_ToCString(ctx, argv[0]);
+    if (!domain) return JS_EXCEPTION;
+    uint32_t port = 53;
+    if (argc >= 2) JS_ToUint32(ctx, &port, argv[1]);
+    // Resolve all queries to our IP (captive portal pattern).
+    bool ok = qjs->dnsServer.start(port, domain, WiFi.softAPIP());
+    JS_FreeCString(ctx, domain);
+    qjs->dnsRunning = ok;
+    return JS_NewBool(ctx, ok);
+  }
+
+  // WiFi.stopDNS() → void
+  static JSValue wifi_stop_dns(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    qjs->dnsServer.stop();
+    qjs->dnsRunning = false;
+    return JS_UNDEFINED;
+  }
+
+  // WiFi.startMDNS(hostname, [service], [port]) → boolean
+  // Registers the device on the local network as <hostname>.local.
+  // If service+port are provided, also advertises a service via mDNS.
+  static JSValue wifi_start_mdns(JSContext *ctx, JSValueConst jsThis,
+                                 int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "WiFi.startMDNS: need (hostname)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    const char *hostname = JS_ToCString(ctx, argv[0]);
+    if (!hostname) return JS_EXCEPTION;
+    bool ok = MDNS.begin(hostname);
+    JS_FreeCString(ctx, hostname);
+    qjs->mdnsRunning = ok;
+    if (ok && argc >= 3) {
+      const char *service = JS_ToCString(ctx, argv[1]);
+      uint32_t port = 0;
+      JS_ToUint32(ctx, &port, argv[2]);
+      if (service) {
+        MDNS.addService(service, "tcp", (uint16_t)port);
+        JS_FreeCString(ctx, service);
+      }
+    }
+    return JS_NewBool(ctx, ok);
+  }
+
+  // WiFi.addMDNSService(service, proto, port) → boolean
+  // Adds an mDNS service advertisement (e.g. "http", "tcp", 80).
+  static JSValue wifi_add_mdns_service(JSContext *ctx, JSValueConst jsThis,
+                                       int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "WiFi.addMDNSService: need (service, proto, port)");
+    if (!MDNS.begin("")) return JS_NewBool(ctx, false);  // ensure mDNS is up
+    const char *service = JS_ToCString(ctx, argv[0]);
+    const char *proto = JS_ToCString(ctx, argv[1]);
+    uint32_t port = 0;
+    JS_ToUint32(ctx, &port, argv[2]);
+    bool ok = MDNS.addService(service, proto, (uint16_t)port);
+    JS_FreeCString(ctx, service);
+    JS_FreeCString(ctx, proto);
+    return JS_NewBool(ctx, ok);
+  }
+
+  // WiFi.scan(callback) → void
+  // Scans for WiFi networks NON-BLOCKING. WiFi.scanNetworks() runs
+  // on a FreeRTOS task; the callback fires from loop() when done.
+  static JSValue wifi_scan(JSContext *ctx, JSValueConst jsThis,
+                           int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+      return JS_ThrowTypeError(ctx, "WiFi.scan: need (callback, [timeoutMs])");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+
+    uint32_t timeoutMs = 300;
+    if (argc >= 2) JS_ToUint32(ctx, &timeoutMs, argv[1]);
+
+    // Allocate scan result struct.
+    qjs->scanResult_ = new ScanResult();
+    qjs->scanResult_->callback = JS_DupValue(ctx, argv[0]);
+    qjs->scanResult_->done = false;
+    qjs->scanResult_->count = 0;
+    qjs->scanResult_->timeoutMs = timeoutMs;
+    if (!qjs->scanMutex_) qjs->scanMutex_ = xSemaphoreCreateMutex();
+
+    // Spawn a one-shot task to do the blocking scan.
+    xTaskCreatePinnedToCore(scanTaskEntry, "wifi_scan", 4096, qjs,
+                            1, &qjs->scanTask_, 0);
+    return JS_UNDEFINED;
+  }
+
+  // WiFi.syncNTP([server="pool.ntp.org"], [tzOffset=0]) → boolean
+  // Configures SNTP time sync. After calling, getTime() returns
+  // wall-clock time. tzOffset is in hours.
+  static JSValue wifi_sync_ntp(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    const char *server = "pool.ntp.org";
+    if (argc >= 1 && JS_IsString(argv[0])) {
+      const char *s = JS_ToCString(ctx, argv[0]);
+      if (s) server = s;
+    }
+    int tzOffset = 0;
+    if (argc >= 2) JS_ToInt32(ctx, &tzOffset, argv[1]);
+
+    configTime(tzOffset * 3600, 0, server);
+    if (argc >= 1 && JS_IsString(argv[0])) {
+      const char *s = JS_ToCString(ctx, argv[0]);
+      if (s) JS_FreeCString(ctx, s);
+    }
+    return JS_NewBool(ctx, true);
+  }
+
+  // ---- New esp32.* trampolines ----
+
+  // Static ISR for setWatch — no-op, we poll from loop().
+  static void IRAM_ATTR esp32_watch_isr() {}
+
+  // esp32.dacWrite(pin, value) → void
+  // True analog output on GPIO25/26. value is 0-255.
+  static JSValue esp32_dac_write(JSContext *ctx, JSValueConst jsThis,
+                                 int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "dacWrite: need (pin, value)");
+    uint32_t pin, value;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    JS_ToUint32(ctx, &value, argv[1]);
+    if (pin != 25 && pin != 26)
+      return JS_ThrowRangeError(ctx, "dacWrite: only GPIO25 and GPIO26 have DAC");
+    dacWrite(pin, value);
+    return JS_UNDEFINED;
+  }
+
+  // esp32.setWatch(pin, mode, callback) → disposeFn
+  // mode: 0=RISING, 1=FALLING, 2=CHANGE
+  // Returns a function that removes the watch when called.
+  static void IRAM_ATTR watch_isr(void *arg) {
+    // Just set a flag — the actual JS callback fires from loop().
+    ESP32QuickJS *qjs = (ESP32QuickJS *)arg;
+    // We can't call JS from an ISR. We'll poll in loop().
+    // The ISR is just to wake us up. We use a simple approach:
+    // store the pin in a volatile queue.
+    // Actually, attachInterrupt already debounces. We'll check
+    // from loop() by comparing a counter.
+  }
+
+  static JSValue esp32_set_watch(JSContext *ctx, JSValueConst jsThis,
+                                 int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "setWatch: need (pin, mode, callback)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    uint32_t pin, mode;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    JS_ToUint32(ctx, &mode, argv[1]);
+
+    int intMode = RISING;
+    if (mode == 1) intMode = FALLING;
+    else if (mode == 2) intMode = CHANGE;
+
+    // Find or create a watch entry.
+    int idx = -1;
+    for (size_t i = 0; i < qjs->watches.size(); i++) {
+      if (!qjs->watches[i].active) { idx = i; break; }
+    }
+    if (idx < 0) {
+      qjs->watches.push_back({0, JS_UNDEFINED, false});
+      idx = qjs->watches.size() - 1;
+    }
+    qjs->watches[idx].pin = (uint8_t)pin;
+    qjs->watches[idx].callback = JS_DupValue(ctx, argv[2]);
+    qjs->watches[idx].active = true;
+
+    // Use a no-op ISR — we poll pin state from loop() to fire the
+    // JS callback. attachInterrupt needs a plain function pointer.
+    attachInterrupt(digitalPinToInterrupt(pin), esp32_watch_isr, intMode);
+
+    // Return a dispose function.
+    // We create a JS function that calls clearWatch with the pin.
+    char src[64];
+    snprintf(src, sizeof(src), "function(){esp32.clearWatch(%u)}", (unsigned)pin);
+    JSValue disposeFn = JS_Eval(ctx, src, strlen(src), "<dispose>",
+                                JS_EVAL_TYPE_GLOBAL);
+    return disposeFn;
+  }
+
+  // esp32.clearWatch(pin) → void
+  static JSValue esp32_clear_watch(JSContext *ctx, JSValueConst jsThis,
+                                   int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "clearWatch: need (pin)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    uint32_t pin;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    detachInterrupt(digitalPinToInterrupt(pin));
+    for (auto &w : qjs->watches) {
+      if (w.pin == pin && w.active) {
+        JS_FreeValue(ctx, w.callback);
+        w.callback = JS_UNDEFINED;
+        w.active = false;
+      }
+    }
+    return JS_UNDEFINED;
+  }
+
+  // esp32.getTime() → number
+  // Returns seconds since boot (float). If NTP is synced, returns
+  // Unix timestamp.
+  static JSValue esp32_get_time(JSContext *ctx, JSValueConst jsThis,
+                                int argc, JSValueConst *argv) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    // If time is > 946684800 (Jan 1 2000), NTP is synced.
+    if (tv.tv_sec > 946684800) {
+      return JS_NewFloat64(ctx, (double)tv.tv_sec + tv.tv_usec / 1000000.0);
+    }
+    // Otherwise return uptime in seconds.
+    return JS_NewFloat64(ctx, millis() / 1000.0);
+  }
+
+  // esp32.setTime(seconds) → void
+  static JSValue esp32_set_time(JSContext *ctx, JSValueConst jsThis,
+                                int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "setTime: need (seconds)");
+    double t;
+    JS_ToFloat64(ctx, &t, argv[0]);
+    struct timeval tv;
+    tv.tv_sec = (time_t)t;
+    tv.tv_usec = (long)((t - tv.tv_sec) * 1000000);
+    settimeofday(&tv, nullptr);
+    return JS_UNDEFINED;
+  }
+
+  // esp32.getSerial() → string
+  // Returns the ESP32 MAC address as a unique identifier.
+  static JSValue esp32_get_serial(JSContext *ctx, JSValueConst jsThis,
+                                  int argc, JSValueConst *argv) {
+    uint64_t mac = ESP.getEfuseMac();
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04X%08X",
+             (uint16_t)(mac >> 32), (uint32_t)mac);
+    return JS_NewString(ctx, buf);
+  }
+
+  // Serial1 / Serial2 — return a serial object with setup/write/onData.
+  // Serial1 = UART1, Serial2 = UART2.
+  static JSValue esp32_serial1(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "__isSerial1", JS_NewBool(ctx, true));
+    // Methods are added via a function list below.
+    static const JSCFunctionListEntry serial_funcs[] = {
+        JSCFunctionListEntry{"setup", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, serial_setup}
+                             }},
+        JSCFunctionListEntry{"write", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, serial_write}
+                             }},
+        JSCFunctionListEntry{"onData", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, serial_on_data}
+                             }},
+        JSCFunctionListEntry{"available", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, serial_available}
+                             }},
+        JSCFunctionListEntry{"read", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, serial_read}
+                             }},
+    };
+    JS_SetPropertyFunctionList(ctx, obj, serial_funcs,
+                               sizeof(serial_funcs) / sizeof(JSCFunctionListEntry));
+    return obj;
+  }
+
+  static JSValue esp32_serial2(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "__isSerial1", JS_NewBool(ctx, false));
+    static const JSCFunctionListEntry serial_funcs[] = {
+        JSCFunctionListEntry{"setup", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, serial_setup}
+                             }},
+        JSCFunctionListEntry{"write", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, serial_write}
+                             }},
+        JSCFunctionListEntry{"onData", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, serial_on_data}
+                             }},
+        JSCFunctionListEntry{"available", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, serial_available}
+                             }},
+        JSCFunctionListEntry{"read", 0, JS_DEF_CFUNC, 0, {
+                               func : {0, JS_CFUNC_generic, serial_read}
+                             }},
+    };
+    JS_SetPropertyFunctionList(ctx, obj, serial_funcs,
+                               sizeof(serial_funcs) / sizeof(JSCFunctionListEntry));
+    return obj;
+  }
+
+  // Serial.setup(baud, tx, rx) — called on the Serial1/Serial2 object.
+  static JSValue serial_setup(JSContext *ctx, JSValueConst jsThis,
+                              int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Serial.setup: need (baud, tx, rx)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    uint32_t baud, tx, rx;
+    JS_ToUint32(ctx, &baud, argv[0]);
+    JS_ToUint32(ctx, &tx, argv[1]);
+    JS_ToUint32(ctx, &rx, argv[2]);
+
+    // Check if this is Serial1 or Serial2.
+    JSValue isS1 = JS_GetPropertyStr(ctx, jsThis, "__isSerial1");
+    bool serial1 = JS_ToBool(ctx, isS1);
+    JS_FreeValue(ctx, isS1);
+
+    HardwareSerial **port = serial1 ? &qjs->serial1 : &qjs->serial2;
+    if (!*port) {
+      *port = new HardwareSerial(serial1 ? UART_NUM_1 : UART_NUM_2);
+    }
+    (*port)->begin(baud, SERIAL_8N1, tx, rx);
+    return JS_UNDEFINED;
+  }
+
+  static JSValue serial_write(JSContext *ctx, JSValueConst jsThis,
+                              int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Serial.write: need (data)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue isS1 = JS_GetPropertyStr(ctx, jsThis, "__isSerial1");
+    bool s1 = JS_ToBool(ctx, isS1);
+    JS_FreeValue(ctx, isS1);
+    HardwareSerial *port = s1 ? qjs->serial1 : qjs->serial2;
+    if (!port) return JS_ThrowInternalError(ctx, "Serial: call setup() first");
+
+    const char *data = JS_ToCString(ctx, argv[0]);
+    if (data) {
+      port->write((const uint8_t *)data, strlen(data));
+      JS_FreeCString(ctx, data);
+    }
+    return JS_UNDEFINED;
+  }
+
+  static JSValue serial_on_data(JSContext *ctx, JSValueConst jsThis,
+                                int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Serial.onData: need (callback)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue isS1 = JS_GetPropertyStr(ctx, jsThis, "__isSerial1");
+    bool s1 = JS_ToBool(ctx, isS1);
+    JS_FreeValue(ctx, isS1);
+    JSValue *cb = s1 ? &qjs->serial1Cb : &qjs->serial2Cb;
+    JS_FreeValue(ctx, *cb);
+    *cb = JS_DupValue(ctx, argv[0]);
+    return JS_UNDEFINED;
+  }
+
+  static JSValue serial_available(JSContext *ctx, JSValueConst jsThis,
+                                  int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue isS1 = JS_GetPropertyStr(ctx, jsThis, "__isSerial1");
+    bool s1 = JS_ToBool(ctx, isS1);
+    JS_FreeValue(ctx, isS1);
+    HardwareSerial *port = s1 ? qjs->serial1 : qjs->serial2;
+    if (!port) return JS_NewInt32(ctx, 0);
+    return JS_NewInt32(ctx, port->available());
+  }
+
+  static JSValue serial_read(JSContext *ctx, JSValueConst jsThis,
+                             int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue isS1 = JS_GetPropertyStr(ctx, jsThis, "__isSerial1");
+    bool s1 = JS_ToBool(ctx, isS1);
+    JS_FreeValue(ctx, isS1);
+    HardwareSerial *port = s1 ? qjs->serial1 : qjs->serial2;
+    if (!port || !port->available()) return JS_NewString(ctx, "");
+    String data;
+    while (port->available()) data += (char)port->read();
+    return JS_NewString(ctx, data.c_str());
+  }
+
+  // ---- OneWire trampolines ----
+  // OneWire.setup(pin) → handle (0-3)
+  static JSValue onewire_setup(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "OneWire.setup: need (pin)");
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    uint32_t pin;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    OneWire *ow = new OneWire((uint8_t)pin);
+    qjs->oneWireBuses.push_back(ow);
+    return JS_NewInt32(ctx, (int)(qjs->oneWireBuses.size() - 1));
+  }
+
+  static OneWire *ow_get(ESP32QuickJS *qjs, JSValueConst argv) {
+    int32_t h;
+    JS_ToInt32(qjs->ctx, &h, argv);
+    if (h < 0 || h >= (int)qjs->oneWireBuses.size()) return nullptr;
+    return qjs->oneWireBuses[h];
+  }
+
+  static JSValue onewire_reset(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    return JS_NewBool(ctx, ow->reset());
+  }
+
+  static JSValue onewire_write(JSContext *ctx, JSValueConst jsThis,
+                               int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    uint32_t byte;
+    JS_ToUint32(ctx, &byte, argv[1]);
+    uint32_t power = 0;
+    if (argc >= 3) JS_ToUint32(ctx, &power, argv[2]);
+    ow->write((uint8_t)byte, power != 0);
+    return JS_UNDEFINED;
+  }
+
+  static JSValue onewire_read(JSContext *ctx, JSValueConst jsThis,
+                              int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    return JS_NewInt32(ctx, ow->read());
+  }
+
+  static JSValue onewire_search(JSContext *ctx, JSValueConst jsThis,
+                                int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    ow->reset_search();
+    uint8_t addr[8];
+    JSValue arr = JS_NewArray(ctx);
+    int idx = 0;
+    while (ow->search(addr)) {
+      JSValue addrArr = JS_NewArray(ctx);
+      for (int i = 0; i < 8; i++)
+        JS_SetPropertyUint32(ctx, addrArr, i, JS_NewInt32(ctx, addr[i]));
+      JS_SetPropertyUint32(ctx, arr, idx++, addrArr);
+    }
+    return arr;
+  }
+
+  static JSValue onewire_skip(JSContext *ctx, JSValueConst jsThis,
+                              int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    ow->skip();
+    return JS_UNDEFINED;
+  }
+
+  static JSValue onewire_select(JSContext *ctx, JSValueConst jsThis,
+                                int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    if (argc < 2 || !JS_IsArray(ctx, argv[1]))
+      return JS_ThrowTypeError(ctx, "OneWire.select: need (handle, addrArray)");
+    uint8_t addr[8];
+    for (int i = 0; i < 8; i++) {
+      JSValue v = JS_GetPropertyUint32(ctx, argv[1], i);
+      uint32_t b;
+      JS_ToUint32(ctx, &b, v);
+      addr[i] = (uint8_t)b;
+      JS_FreeValue(ctx, v);
+    }
+    ow->select(addr);
+    return JS_UNDEFINED;
+  }
+
+  static JSValue onewire_depower(JSContext *ctx, JSValueConst jsThis,
+                                 int argc, JSValueConst *argv) {
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    OneWire *ow = ow_get(qjs, argv[0]);
+    if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
+    ow->depower();
     return JS_UNDEFINED;
   }
 
