@@ -4133,6 +4133,12 @@ class ESP32QuickJS {
         JSCFunctionListEntry{"setLoop", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_set_loop}
                              }},
+        JSCFunctionListEntry{"tone", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, esp32_tone}
+                             }},
+        JSCFunctionListEntry{"noTone", 0, JS_DEF_CFUNC, 0, {
+                               func : {1, JS_CFUNC_generic, esp32_no_tone}
+                             }},
     };
 
     // I2C = { open, close, write, read, writeRead }
@@ -4632,6 +4638,67 @@ class ESP32QuickJS {
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     qjs->setLoopFunc(JS_DupValue(ctx, argv[0]));
     return JS_UNDEFINED;
+  }
+
+  // esp32.tone(pin, frequency, [durationMs]) → Promise<void>
+  // Plays a square-wave tone on `pin` using the LEDC peripheral.
+  // 50% duty cycle at the requested frequency. If `durationMs` is
+  // provided, the tone auto-stops after that many milliseconds (via
+  // setTimeout); otherwise it plays until esp32.noTone(pin) is called.
+  // Uses the same LEDC channel pool as writeAnalog/analogWrite.
+  static JSValue esp32_tone(JSContext *ctx, JSValueConst jsThis, int argc,
+                            JSValueConst *argv) {
+    if (argc < 2) {
+      return JS_ThrowTypeError(ctx, "tone: need (pin, frequency, [durationMs])");
+    }
+    uint32_t pin, frequency;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    JS_ToUint32(ctx, &frequency, argv[1]);
+    uint32_t durationMs = 0;
+    if (argc >= 3) JS_ToUint32(ctx, &durationMs, argv[2]);
+
+    // Forward to writeAnalog with 50% duty at 10-bit resolution.
+    // 50% of 1023 = 511. This gives a clean square wave.
+    JSValue wargv[4] = {
+      JS_NewUint32(ctx, pin),
+      JS_NewUint32(ctx, 511),         // 50% duty (10-bit)
+      JS_NewUint32(ctx, frequency),   // frequency in Hz
+      JS_NewUint32(ctx, 10),          // 10-bit resolution
+    };
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
+
+    // If a duration was given, schedule auto-stop via setTimeout.
+    if (durationMs > 0 && !JS_IsException(ret)) {
+      // Build: setTimeout(() => esp32.noTone(pin), durationMs)
+      // We call writeAnalogStop directly via the analog member.
+      // Use a simple approach: queue a setTimeout that calls noTone.
+      // Since we can't easily create a JS closure capturing pin,
+      // we use a C-side timer. The simplest: use the JS timer system
+      // by eval'ing a small script.
+      char script[128];
+      snprintf(script, sizeof(script),
+        "setTimeout(function(){ esp32.noTone(%u); }, %u)",
+        (unsigned)pin, (unsigned)durationMs);
+      JSValue ev = JS_Eval(ctx, script, strlen(script),
+                           "<tone-auto-stop>", JS_EVAL_TYPE_GLOBAL);
+      JS_FreeValue(ctx, ev);
+    }
+    return ret;
+  }
+
+  // esp32.noTone(pin) → Promise<void>
+  // Stops a tone on `pin`. Equivalent to writeAnalogStop(pin).
+  static JSValue esp32_no_tone(JSContext *ctx, JSValueConst jsThis, int argc,
+                               JSValueConst *argv) {
+    if (argc < 1) {
+      return JS_ThrowTypeError(ctx, "noTone: need (pin)");
+    }
+    uint32_t pin;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+    return qjs->analog.js_writeAnalogStop(ctx, argc, argv);
   }
 
   static JSValue wifi_is_connected(JSContext *ctx, JSValueConst jsThis,
