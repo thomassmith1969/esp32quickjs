@@ -1116,7 +1116,7 @@ class JSI2C {
  public:
   static constexpr const char* TAG = "JSI2C";
 
-  enum OpKind { OP_WRITE, OP_READ, OP_WRITE_READ, OP_OPEN };
+  enum OpKind { OP_WRITE, OP_READ, OP_WRITE_READ, OP_OPEN, OP_CLOSE };
 
   struct Entry {
     OpKind kind;
@@ -1125,10 +1125,17 @@ class JSI2C {
     int rlen;
     int mode;  // 0=string, 1=array, 2=hex
     // OP_OPEN-only: parameters captured at call time so the actual driver
-    // install runs from loop() (non-blocking wrt the JS engine).
+    // install runs from the task (non-blocking wrt the JS engine).
     int sda, scl;
     uint32_t freq;
+    int busHandle;   // set by task for OP_OPEN result
+    int busIdx;      // bus index for OP_CLOSE
     JSValue resolving_funcs[2];
+    // Output (written by task, read by JS thread):
+    volatile bool done;
+    volatile bool ok;       // true = success, false = error
+    esp_err_t result;
+    std::vector<uint8_t> rx;
   };
 
   struct Bus {
@@ -1140,134 +1147,257 @@ class JSI2C {
 
   JSI2C() = default;
 
-  // Returns true if a queued entry was processed this tick.
-  bool loop(JSContext* ctx) {
-    if (queue.empty()) return false;
-    Entry e = std::move(queue.front());
-    queue.erase(queue.begin());
+  // ---- Background task infrastructure (mirrors JSHttpFetcher) ----
+ private:
+  TaskHandle_t task_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
+  SemaphoreHandle_t notify_ = nullptr;
+  volatile bool stopping_ = false;
+  std::vector<Entry*> doneQueue_;  // completed entries (read by JS thread)
 
-    // OP_OPEN runs first: it doesn't need an installed bus, it installs one.
-    if (e.kind == OP_OPEN) {
+  static void taskEntry(void *arg) {
+    static_cast<JSI2C *>(arg)->workerTask();
+    vTaskDelete(nullptr);
+  }
+
+  void workerTask() {
+    while (true) {
+      xSemaphoreTake(notify_, portMAX_DELAY);
+      if (stopping_) break;
+      std::vector<Entry*> work;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      work.swap(workQueue_);
+      xSemaphoreGive(mutex_);
+      for (auto *e : work) processEntry(e);
+    }
+  }
+
+  // Runs on the background task. Does all blocking I2C calls and writes
+  // results back into the Entry. The JS thread resolves Promises in loop().
+  void processEntry(Entry *e) {
+    if (e->kind == OP_OPEN) {
       // Idempotent: if a bus with the same sda/scl/freq is already
-      // installed, resolve with that handle instead of installing again.
-      for (size_t i = 0; i < instance->buses.size(); i++) {
-        Bus& existing = instance->buses[i];
-        if (existing.installed && existing.port == I2C_NUM_0 &&
-            existing.sda == e.sda && existing.scl == e.scl &&
-            existing.freq == e.freq) {
-          JSValue v = JS_NewInt32(ctx, (int)i);
-          JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &v);
-          JS_FreeValue(ctx, v);
-          JS_FreeValue(ctx, e.resolving_funcs[0]);
-          JS_FreeValue(ctx, e.resolving_funcs[1]);
-          return true;
+      // installed, reuse that handle instead of installing again.
+      int existing = -1;
+      for (size_t i = 0; i < buses.size(); i++) {
+        Bus &b = buses[i];
+        if (b.installed && b.port == I2C_NUM_0 && b.sda == e->sda &&
+            b.scl == e->scl && b.freq == e->freq) {
+          existing = (int)i;
+          break;
         }
       }
-
+      if (existing >= 0) {
+        e->ok = true;
+        e->busHandle = existing;
+        e->result = ESP_OK;
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        e->done = true;
+        doneQueue_.push_back(e);
+        xSemaphoreGive(mutex_);
+        return;
+      }
       esp_err_t r1 = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
       if (r1 != ESP_OK) {
-        char errBuf[64];
-        snprintf(errBuf, sizeof(errBuf), "I2C: i2c_driver_install failed (0x%x)", (int)r1);
-        JSValue err = JS_NewString(ctx, errBuf);
-        JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-        JS_FreeValue(ctx, err);
-        JS_FreeValue(ctx, e.resolving_funcs[0]);
-        JS_FreeValue(ctx, e.resolving_funcs[1]);
-        return true;
+        e->ok = false;
+        e->result = r1;
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        e->done = true;
+        doneQueue_.push_back(e);
+        xSemaphoreGive(mutex_);
+        return;
       }
-      esp_err_t r2 = i2c_set_pin(I2C_NUM_0, e.sda, e.scl, GPIO_PULLUP_ENABLE,
-                                  GPIO_PULLUP_ENABLE, I2C_MODE_MASTER);
+      esp_err_t r2 = i2c_set_pin(I2C_NUM_0, e->sda, e->scl,
+                                  GPIO_PULLUP_ENABLE, GPIO_PULLUP_ENABLE,
+                                  I2C_MODE_MASTER);
       if (r2 != ESP_OK) {
         i2c_driver_delete(I2C_NUM_0);
-        char errBuf[64];
-        snprintf(errBuf, sizeof(errBuf), "I2C: i2c_set_pin failed (0x%x)", (int)r2);
-        JSValue err = JS_NewString(ctx, errBuf);
-        JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-        JS_FreeValue(ctx, err);
-        JS_FreeValue(ctx, e.resolving_funcs[0]);
-        JS_FreeValue(ctx, e.resolving_funcs[1]);
-        return true;
+        e->ok = false;
+        e->result = r2;
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        e->done = true;
+        doneQueue_.push_back(e);
+        xSemaphoreGive(mutex_);
+        return;
       }
       Bus bus;
       bus.port = I2C_NUM_0;
-      bus.sda = e.sda;
-      bus.scl = e.scl;
-      bus.freq = e.freq;
+      bus.sda = e->sda;
+      bus.scl = e->scl;
+      bus.freq = e->freq;
       bus.installed = true;
-      instance->buses.push_back(bus);
-      int handle = (int)(instance->buses.size() - 1);
-      JSValue v = JS_NewInt32(ctx, handle);
-      JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &v);
-      JS_FreeValue(ctx, v);
-      JS_FreeValue(ctx, e.resolving_funcs[0]);
-      JS_FreeValue(ctx, e.resolving_funcs[1]);
-      return true;
+      buses.push_back(bus);
+      e->ok = true;
+      e->busHandle = (int)(buses.size() - 1);
+      e->result = ESP_OK;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->done = true;
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
+      return;
     }
 
-    Bus* b = nullptr;
-    for (auto& bus : buses) {
+    if (e->kind == OP_CLOSE) {
+      if (e->busIdx >= 0 && e->busIdx < (int)buses.size() &&
+          buses[e->busIdx].installed) {
+        e->result = i2c_driver_delete(buses[e->busIdx].port);
+        buses[e->busIdx].installed = false;
+        e->ok = (e->result == ESP_OK);
+      } else {
+        e->ok = false;
+        e->result = ESP_ERR_INVALID_ARG;
+      }
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->done = true;
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
+      return;
+    }
+
+    // OP_WRITE / OP_READ / OP_WRITE_READ — find an installed bus.
+    Bus *b = nullptr;
+    for (auto &bus : buses) {
       if (bus.installed) { b = &bus; break; }
     }
     if (!b) {
-      JSValue err = JS_NewString(ctx, "I2C: no installed bus");
-      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
-      JS_FreeValue(ctx, e.resolving_funcs[0]);
-      JS_FreeValue(ctx, e.resolving_funcs[1]);
-      return true;
+      e->ok = false;
+      e->result = ESP_ERR_NOT_FOUND;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->done = true;
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
+      return;
     }
 
     esp_err_t res = ESP_FAIL;
     std::vector<uint8_t> rx;
-    if (e.kind == OP_WRITE) {
-      res = i2c_master_write_to_device(b->port, (uint8_t)e.addr,
-                                        e.wdata.data(), e.wdata.size(),
+    if (e->kind == OP_WRITE) {
+      res = i2c_master_write_to_device(b->port, (uint8_t)e->addr,
+                                        e->wdata.data(), e->wdata.size(),
                                         pdMS_TO_TICKS(1000));
-    } else if (e.kind == OP_READ) {
-      rx.resize(e.rlen);
-      res = i2c_master_read_from_device(b->port, (uint8_t)e.addr,
-                                        rx.data(), e.rlen,
+    } else if (e->kind == OP_READ) {
+      rx.resize(e->rlen);
+      res = i2c_master_read_from_device(b->port, (uint8_t)e->addr,
+                                        rx.data(), e->rlen,
                                         pdMS_TO_TICKS(1000));
     } else {  // OP_WRITE_READ
-      rx.resize(e.rlen);
-      res = i2c_master_write_read_device(b->port, (uint8_t)e.addr,
-                                         e.wdata.data(), e.wdata.size(),
-                                         rx.data(), e.rlen,
+      rx.resize(e->rlen);
+      res = i2c_master_write_read_device(b->port, (uint8_t)e->addr,
+                                         e->wdata.data(), e->wdata.size(),
+                                         rx.data(), e->rlen,
                                          pdMS_TO_TICKS(1000));
     }
+    e->result = res;
+    e->ok = (res == ESP_OK);
+    if (res == ESP_OK) e->rx = std::move(rx);
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    e->done = true;
+    doneQueue_.push_back(e);
+    xSemaphoreGive(mutex_);
+  }
 
-    if (res == ESP_OK) {
-      JSValue r = (e.kind == OP_WRITE)
-                      ? JS_NewBool(ctx, true)
-                      : formatResult(ctx, e.mode, rx);
-      JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-    } else {
-      char errBuf[64];
-      snprintf(errBuf, sizeof(errBuf), "I2C error: 0x%x (%d)", (int)res, (int)res);
-      JSValue err = JS_NewString(ctx, errBuf);
-      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
+ public:
+  void init() {
+    if (task_) return;
+    mutex_ = xSemaphoreCreateMutex();
+    notify_ = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(taskEntry, "js_i2c", 4096, this, 1, &task_, 0);
+  }
+
+  // Returns true if a queued entry was processed this tick.
+  bool loop(JSContext* ctx) {
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (doneQueue_.empty()) { xSemaphoreGive(mutex_); return false; }
+    std::vector<Entry*> ready;
+    ready.swap(doneQueue_);
+    xSemaphoreGive(mutex_);
+
+    for (Entry *e : ready) {
+      bool ok = e->ok;
+      esp_err_t res = e->result;
+      int mode = e->mode;
+      OpKind kind = e->kind;
+      int busHandle = e->busHandle;
+      std::vector<uint8_t> rx = std::move(e->rx);
+      JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
+      JSContext *ectx = ctx;
+
+      if (ok) {
+        JSValue r;
+        if (kind == OP_OPEN) {
+          r = JS_NewInt32(ectx, busHandle);
+        } else if (kind == OP_CLOSE) {
+          r = JS_UNDEFINED;
+        } else if (kind == OP_WRITE) {
+          r = JS_NewBool(ectx, true);
+        } else {
+          r = formatResult(ectx, mode, rx);
+        }
+        JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &r);
+        JS_FreeValue(ectx, r);
+      } else {
+        char errBuf[64];
+        if (kind == OP_OPEN) {
+          snprintf(errBuf, sizeof(errBuf),
+                   "I2C: install/set_pin failed (0x%x)", (int)res);
+        } else if (kind == OP_CLOSE) {
+          snprintf(errBuf, sizeof(errBuf),
+                   "I2C: close failed (0x%x)", (int)res);
+        } else if (res == ESP_ERR_NOT_FOUND) {
+          snprintf(errBuf, sizeof(errBuf), "I2C: no installed bus");
+        } else {
+          snprintf(errBuf, sizeof(errBuf), "I2C error: 0x%x (%d)",
+                   (int)res, (int)res);
+        }
+        JSValue err = JS_NewString(ectx, errBuf);
+        JS_Call(ectx, rfs[1], JS_UNDEFINED, 1, &err);
+        JS_FreeValue(ectx, err);
+      }
+      JS_FreeValue(ectx, rfs[0]);
+      JS_FreeValue(ectx, rfs[1]);
+      delete e;
     }
-    JS_FreeValue(ctx, e.resolving_funcs[0]);
-    JS_FreeValue(ctx, e.resolving_funcs[1]);
     return true;
   }
 
   void end(JSContext* ctx) {
+    // Stop the background task first.
+    stopping_ = true;
+    if (notify_) xSemaphoreGive(notify_);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (task_) { vTaskDelete(task_); task_ = nullptr; }
+
+    // Reject any still-pending entries (never picked up by the task).
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    for (auto *e : queue) {
+      JSValue r = JS_UNDEFINED;
+      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e->resolving_funcs[0]);
+      JS_FreeValue(ctx, e->resolving_funcs[1]);
+      delete e;
+    }
+    queue.clear();
+    for (auto *e : doneQueue_) {
+      JSValue r = JS_UNDEFINED;
+      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e->resolving_funcs[0]);
+      JS_FreeValue(ctx, e->resolving_funcs[1]);
+      delete e;
+    }
+    doneQueue_.clear();
+    xSemaphoreGive(mutex_);
+
     for (auto& b : buses) {
       if (b.installed) i2c_driver_delete(b.port);
       b.installed = false;
     }
     buses.clear();
-    for (auto& e : queue) {
-      JSValue r = JS_UNDEFINED;
-      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-      JS_FreeValue(ctx, e.resolving_funcs[0]);
-      JS_FreeValue(ctx, e.resolving_funcs[1]);
-    }
-    queue.clear();
+
+    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
+    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
+    stopping_ = false;
   }
 
   // ---- static JS trampolines (called from the C function list) ----
@@ -1311,9 +1441,19 @@ class JSI2C {
     e.sda = sda;
     e.scl = scl;
     e.freq = freq;
+    e.busHandle = -1;
+    e.busIdx = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1328,18 +1468,21 @@ class JSI2C {
     JS_ToInt32(ctx, &idx, argv[0]);
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-    if (idx < 0 || idx >= (int)instance->buses.size() ||
-        !instance->buses[idx].installed) {
-      JSValue err = JS_NewString(ctx, "I2C.close: invalid bus handle");
-      JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
-    } else {
-      i2c_driver_delete(instance->buses[idx].port);
-      instance->buses[idx].installed = false;
-      JSValue r = JS_UNDEFINED;
-      JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-    }
+    Entry e;
+    e.kind = OP_CLOSE;
+    e.busIdx = (int)idx;
+    e.busHandle = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
+    e.resolving_funcs[0] = resolving_funcs[0];
+    e.resolving_funcs[1] = resolving_funcs[1];
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -1374,9 +1517,19 @@ class JSI2C {
     e.wdata = std::move(data);
     e.rlen = 0;
     e.mode = 0;
+    e.busHandle = -1;
+    e.busIdx = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1417,9 +1570,19 @@ class JSI2C {
     e.addr = (int)addr;
     e.rlen = (int)len;
     e.mode = mode;
+    e.busHandle = -1;
+    e.busIdx = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1465,9 +1628,19 @@ class JSI2C {
     e.wdata = std::move(data);
     e.rlen = (int)len;
     e.mode = mode;
+    e.busHandle = -1;
+    e.busIdx = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1533,7 +1706,8 @@ class JSI2C {
 
  private:
   std::vector<Bus> buses;
-  std::vector<Entry> queue;
+  std::vector<Entry*> queue;          // all pending entries (JS thread)
+  std::vector<Entry*> workQueue_;     // entries waiting for the task
 };
 inline JSI2C* JSI2C::instance = nullptr;
 
@@ -1555,7 +1729,7 @@ class JSSPI {
  public:
   static constexpr const char* TAG = "JSSPI";
 
-  enum OpKind { OP_TRANSFER, OP_WRITE, OP_READ, OP_OPEN };
+  enum OpKind { OP_TRANSFER, OP_WRITE, OP_READ, OP_OPEN, OP_CLOSE };
 
   struct Entry {
     OpKind kind;
@@ -1564,12 +1738,18 @@ class JSSPI {
     int rlen;
     int mode;         // 0=string, 1=array, 2=hex
     // OP_OPEN-only: parameters captured at call time. The actual
-    // spi_bus_initialize + spi_bus_add_device run from loop() so the
+    // spi_bus_initialize + spi_bus_add_device run from the task so the
     // JS engine is never blocked.
     int sck, miso, mosi, cs;
     uint32_t freq;
     uint8_t spimode;
+    int devHandle;    // set by task for OP_OPEN result
     JSValue resolving_funcs[2];
+    // Output (written by task, read by JS thread):
+    volatile bool done;
+    volatile bool ok;       // true = success, false = error
+    esp_err_t result;
+    std::vector<uint8_t> rx;
   };
 
   struct Device {
@@ -1583,21 +1763,42 @@ class JSSPI {
 
   JSSPI() = default;
 
-  bool loop(JSContext* ctx) {
-    if (queue.empty()) return false;
-    Entry e = std::move(queue.front());
-    queue.erase(queue.begin());
+  // ---- Background task infrastructure (mirrors JSHttpFetcher) ----
+ private:
+  TaskHandle_t task_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
+  SemaphoreHandle_t notify_ = nullptr;
+  volatile bool stopping_ = false;
+  std::vector<Entry*> doneQueue_;  // completed entries (read by JS thread)
 
-    // OP_OPEN: install the bus + add the device. Runs in loop() so
-    // spi_bus_initialize never blocks the JS engine.
-    if (e.kind == OP_OPEN) {
+  static void taskEntry(void *arg) {
+    static_cast<JSSPI *>(arg)->workerTask();
+    vTaskDelete(nullptr);
+  }
+
+  void workerTask() {
+    while (true) {
+      xSemaphoreTake(notify_, portMAX_DELAY);
+      if (stopping_) break;
+      std::vector<Entry*> work;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      work.swap(workQueue_);
+      xSemaphoreGive(mutex_);
+      for (auto *e : work) processEntry(e);
+    }
+  }
+
+  // Runs on the background task. Does all blocking SPI calls and writes
+  // results back into the Entry. The JS thread resolves Promises in loop().
+  void processEntry(Entry *e) {
+    if (e->kind == OP_OPEN) {
       Device d;
-      d.sck = e.sck;
-      d.miso = e.miso;
-      d.mosi = e.mosi;
-      d.cs = e.cs;
-      d.freq = e.freq;
-      d.mode = e.spimode;
+      d.sck = e->sck;
+      d.miso = e->miso;
+      d.mosi = e->mosi;
+      d.cs = e->cs;
+      d.freq = e->freq;
+      d.mode = e->spimode;
 
       spi_bus_config_t buscfg = {};
       buscfg.mosi_io_num = d.mosi;
@@ -1615,14 +1816,13 @@ class JSSPI {
         if (ires == ESP_ERR_INVALID_STATE) {
           d.bus_initialized = false;
         } else if (ires != ESP_OK) {
-          char errBuf[80];
-          snprintf(errBuf, sizeof(errBuf), "SPI: spi_bus_initialize failed (0x%x)", (int)ires);
-          JSValue err = JS_NewString(ctx, errBuf);
-          JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-          JS_FreeValue(ctx, err);
-          JS_FreeValue(ctx, e.resolving_funcs[0]);
-          JS_FreeValue(ctx, e.resolving_funcs[1]);
-          return true;
+          e->ok = false;
+          e->result = ires;
+          xSemaphoreTake(mutex_, portMAX_DELAY);
+          e->done = true;
+          doneQueue_.push_back(e);
+          xSemaphoreGive(mutex_);
+          return;
         } else {
           d.bus_initialized = true;
         }
@@ -1640,77 +1840,182 @@ class JSSPI {
       ires = spi_bus_add_device(d.host, &devcfg, &handle);
       if (ires != ESP_OK) {
         if (d.bus_initialized) spi_bus_free(d.host);
-        char errBuf[80];
-        snprintf(errBuf, sizeof(errBuf), "SPI: spi_bus_add_device failed (0x%x)", (int)ires);
-        JSValue err = JS_NewString(ctx, errBuf);
-        JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-        JS_FreeValue(ctx, err);
-        JS_FreeValue(ctx, e.resolving_funcs[0]);
-        JS_FreeValue(ctx, e.resolving_funcs[1]);
-        return true;
+        e->ok = false;
+        e->result = ires;
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        e->done = true;
+        doneQueue_.push_back(e);
+        xSemaphoreGive(mutex_);
+        return;
       }
       d.handle = handle;
-      instance->devices.push_back(d);
-      int devHandle = (int)(instance->devices.size() - 1);
-      JSValue v = JS_NewInt32(ctx, devHandle);
-      JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &v);
-      JS_FreeValue(ctx, v);
-      JS_FreeValue(ctx, e.resolving_funcs[0]);
-      JS_FreeValue(ctx, e.resolving_funcs[1]);
-      return true;
+      devices.push_back(d);
+      e->ok = true;
+      e->devHandle = (int)(devices.size() - 1);
+      e->result = ESP_OK;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->done = true;
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
+      return;
     }
 
-    if (e.devIdx < 0 || e.devIdx >= (int)devices.size() ||
-        !devices[e.devIdx].handle) {
-      JSValue err = JS_NewString(ctx, "SPI: invalid device handle");
-      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
-      JS_FreeValue(ctx, e.resolving_funcs[0]);
-      JS_FreeValue(ctx, e.resolving_funcs[1]);
-      return true;
+    if (e->kind == OP_CLOSE) {
+      if (e->devIdx >= 0 && e->devIdx < (int)devices.size() &&
+          devices[e->devIdx].handle) {
+        spi_bus_remove_device(devices[e->devIdx].handle);
+        if (devices[e->devIdx].bus_initialized) {
+          spi_bus_free(devices[e->devIdx].host);
+        }
+        devices[e->devIdx].handle = nullptr;
+        devices[e->devIdx].bus_initialized = false;
+        e->ok = true;
+        e->result = ESP_OK;
+      } else {
+        e->ok = false;
+        e->result = ESP_ERR_INVALID_ARG;
+      }
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->done = true;
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
+      return;
     }
-    spi_device_handle_t h = devices[e.devIdx].handle;
+
+    // OP_TRANSFER / OP_WRITE / OP_READ
+    if (e->devIdx < 0 || e->devIdx >= (int)devices.size() ||
+        !devices[e->devIdx].handle) {
+      e->ok = false;
+      e->result = ESP_ERR_NOT_FOUND;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->done = true;
+      doneQueue_.push_back(e);
+      xSemaphoreGive(mutex_);
+      return;
+    }
+    spi_device_handle_t h = devices[e->devIdx].handle;
     std::vector<uint8_t> rx;
     esp_err_t res = ESP_FAIL;
-    if (e.kind == OP_TRANSFER) {
-      rx.resize(e.tx.size());
+    if (e->kind == OP_TRANSFER) {
+      rx.resize(e->tx.size());
       spi_transaction_t t{};
-      t.length = e.tx.size() * 8;
-      t.tx_buffer = e.tx.data();
+      t.length = e->tx.size() * 8;
+      t.tx_buffer = e->tx.data();
       t.rx_buffer = rx.data();
       res = spi_device_polling_transmit(h, &t);
-    } else if (e.kind == OP_WRITE) {
+    } else if (e->kind == OP_WRITE) {
       spi_transaction_t t{};
-      t.length = e.tx.size() * 8;
-      t.tx_buffer = e.tx.data();
+      t.length = e->tx.size() * 8;
+      t.tx_buffer = e->tx.data();
       res = spi_device_polling_transmit(h, &t);
     } else {  // OP_READ
-      rx.resize(e.rlen);
+      rx.resize(e->rlen);
       spi_transaction_t t{};
-      t.length = e.rlen * 8;
+      t.length = e->rlen * 8;
       t.rx_buffer = rx.data();
       res = spi_device_polling_transmit(h, &t);
     }
+    e->result = res;
+    e->ok = (res == ESP_OK);
+    if (res == ESP_OK) e->rx = std::move(rx);
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    e->done = true;
+    doneQueue_.push_back(e);
+    xSemaphoreGive(mutex_);
+  }
 
-    if (res == ESP_OK) {
-      JSValue r = (e.kind == OP_WRITE)
-                      ? JS_NewBool(ctx, true)
-                      : formatResult(ctx, e.mode, rx);
-      JS_Call(ctx, e.resolving_funcs[0], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-    } else {
-      char errBuf[64];
-      snprintf(errBuf, sizeof(errBuf), "SPI error: 0x%x (%d)", (int)res, (int)res);
-      JSValue err = JS_NewString(ctx, errBuf);
-      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
+ public:
+  void init() {
+    if (task_) return;
+    mutex_ = xSemaphoreCreateMutex();
+    notify_ = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(taskEntry, "js_spi", 4096, this, 1, &task_, 0);
+  }
+
+  bool loop(JSContext* ctx) {
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (doneQueue_.empty()) { xSemaphoreGive(mutex_); return false; }
+    std::vector<Entry*> ready;
+    ready.swap(doneQueue_);
+    xSemaphoreGive(mutex_);
+
+    for (Entry *e : ready) {
+      bool ok = e->ok;
+      esp_err_t res = e->result;
+      int mode = e->mode;
+      OpKind kind = e->kind;
+      int devHandle = e->devHandle;
+      std::vector<uint8_t> rx = std::move(e->rx);
+      JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
+      JSContext *ectx = ctx;
+
+      if (ok) {
+        JSValue r;
+        if (kind == OP_OPEN) {
+          r = JS_NewInt32(ectx, devHandle);
+        } else if (kind == OP_CLOSE) {
+          r = JS_UNDEFINED;
+        } else if (kind == OP_WRITE) {
+          r = JS_NewBool(ectx, true);
+        } else {
+          r = formatResult(ectx, mode, rx);
+        }
+        JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &r);
+        JS_FreeValue(ectx, r);
+      } else {
+        char errBuf[80];
+        if (kind == OP_OPEN) {
+          snprintf(errBuf, sizeof(errBuf),
+                   "SPI: bus_initialize/add_device failed (0x%x)", (int)res);
+        } else if (kind == OP_CLOSE) {
+          snprintf(errBuf, sizeof(errBuf),
+                   "SPI: close failed (0x%x)", (int)res);
+        } else if (res == ESP_ERR_NOT_FOUND) {
+          snprintf(errBuf, sizeof(errBuf), "SPI: invalid device handle");
+        } else {
+          snprintf(errBuf, sizeof(errBuf), "SPI error: 0x%x (%d)",
+                   (int)res, (int)res);
+        }
+        JSValue err = JS_NewString(ectx, errBuf);
+        JS_Call(ectx, rfs[1], JS_UNDEFINED, 1, &err);
+        JS_FreeValue(ectx, err);
+      }
+      JS_FreeValue(ectx, rfs[0]);
+      JS_FreeValue(ectx, rfs[1]);
+      delete e;
     }
-    JS_FreeValue(ctx, e.resolving_funcs[0]);
-    JS_FreeValue(ctx, e.resolving_funcs[1]);
     return true;
   }
 
   void end(JSContext* ctx) {
+    // Stop the background task first.
+    stopping_ = true;
+    if (notify_) xSemaphoreGive(notify_);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (task_) { vTaskDelete(task_); task_ = nullptr; }
+
+    // Reject any still-pending entries (never picked up by the task).
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    for (auto *e : queue) {
+      JSValue r = JS_UNDEFINED;
+      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e->resolving_funcs[0]);
+      JS_FreeValue(ctx, e->resolving_funcs[1]);
+      delete e;
+    }
+    queue.clear();
+    for (auto *e : doneQueue_) {
+      JSValue r = JS_UNDEFINED;
+      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
+      JS_FreeValue(ctx, r);
+      JS_FreeValue(ctx, e->resolving_funcs[0]);
+      JS_FreeValue(ctx, e->resolving_funcs[1]);
+      delete e;
+    }
+    doneQueue_.clear();
+    xSemaphoreGive(mutex_);
+
     for (auto& d : devices) {
       if (d.handle) {
         spi_bus_remove_device(d.handle);
@@ -1722,14 +2027,10 @@ class JSSPI {
       }
     }
     devices.clear();
-    for (auto& e : queue) {
-      JSValue r = JS_UNDEFINED;
-      JS_Call(ctx, e.resolving_funcs[1], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-      JS_FreeValue(ctx, e.resolving_funcs[0]);
-      JS_FreeValue(ctx, e.resolving_funcs[1]);
-    }
-    queue.clear();
+
+    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
+    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
+    stopping_ = false;
   }
 
   // ---- static JS trampolines (called from the C function list) ----
@@ -1785,9 +2086,18 @@ class JSSPI {
     e.cs = cs;
     e.freq = freq;
     e.spimode = (uint8_t)mode;
+    e.devHandle = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1802,22 +2112,21 @@ class JSSPI {
     JS_ToInt32(ctx, &idx, argv[0]);
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-    if (idx < 0 || idx >= (int)instance->devices.size() ||
-        !instance->devices[idx].handle) {
-      JSValue err = JS_NewString(ctx, "SPI.close: invalid device handle");
-      JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &err);
-      JS_FreeValue(ctx, err);
-    } else {
-      spi_bus_remove_device(instance->devices[idx].handle);
-      if (instance->devices[idx].bus_initialized) {
-        spi_bus_free(instance->devices[idx].host);
-      }
-      instance->devices[idx].handle = nullptr;
-      instance->devices[idx].bus_initialized = false;
-      JSValue r = JS_UNDEFINED;
-      JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-    }
+    Entry e;
+    e.kind = OP_CLOSE;
+    e.devIdx = (int)idx;
+    e.devHandle = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
+    e.resolving_funcs[0] = resolving_funcs[0];
+    e.resolving_funcs[1] = resolving_funcs[1];
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -1857,9 +2166,18 @@ class JSSPI {
     e.tx = std::move(data);
     e.rlen = 0;
     e.mode = mode;
+    e.devHandle = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1888,9 +2206,18 @@ class JSSPI {
     e.tx = std::move(data);
     e.rlen = 0;
     e.mode = 0;
+    e.devHandle = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1927,9 +2254,18 @@ class JSSPI {
     e.devIdx = (int)idx;
     e.rlen = (int)len;
     e.mode = mode;
+    e.devHandle = -1;
+    e.done = false;
+    e.ok = false;
+    e.result = ESP_FAIL;
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
-    instance->queue.push_back(std::move(e));
+    Entry *ep = new Entry(std::move(e));
+    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    instance->queue.push_back(ep);
+    instance->workQueue_.push_back(ep);
+    xSemaphoreGive(instance->mutex_);
+    xSemaphoreGive(instance->notify_);
     return promise;
   }
 
@@ -1960,7 +2296,8 @@ class JSSPI {
 
  private:
   std::vector<Device> devices;
-  std::vector<Entry> queue;
+  std::vector<Entry*> queue;          // all pending entries (JS thread)
+  std::vector<Entry*> workQueue_;     // entries waiting for the task
 };
 inline JSSPI* JSSPI::instance = nullptr;
 
@@ -2904,6 +3241,8 @@ class ESP32QuickJS {
     analog.init();
     JSI2C::instance = &i2c;
     JSSPI::instance = &spi;
+    i2c.init();
+    spi.init();
     JSServo::instance = &servo;
     servo.analog = &analog;  // let servo.attach reject pins LEDC owns
     servo.init();
@@ -3005,17 +3344,37 @@ class ESP32QuickJS {
   // and `const` are function-scoped, not block-scoped, so they
   // don't leak to subsequent evals — same as the JS spec.
   JSValue evalAsync(const char *code) {
-    // Wrap: "(async()=>{ <code> })()"
+    // Try wrapping as an expression first: "(async()=>{ return ( <code> ) })()"
+    // This makes `await fetch(...)` print the resolved value instead of
+    // undefined. If the code contains statements (let/const/function/for/
+    // if/etc.), the `return (...)` wrap causes a SyntaxError, and we fall
+    // back to statement mode: "(async()=>{ <code> })()"
     size_t n = strlen(code);
-    // Prefix + suffix + NUL
-    const char* prefix = "(async()=>{\n";
-    const char* suffix = "\n})()";
-    size_t total = strlen(prefix) + n + strlen(suffix) + 1;
-    char* wrapped = (char*)js_malloc(ctx, total);
+    
+    // First try: expression mode (return the value).
+    const char* prefix1 = "(async()=>{ return (";
+    const char* suffix1 = "); })()";
+    size_t total1 = strlen(prefix1) + n + strlen(suffix1) + 1;
+    char* wrapped = (char*)js_malloc(ctx, total1);
     if (!wrapped) return JS_EXCEPTION;
-    snprintf(wrapped, total, "%s%s%s", prefix, code, suffix);
-    JSValue ret = JS_Eval(ctx, wrapped, total - 1, "<eval-async>",
+    snprintf(wrapped, total1, "%s%s%s", prefix1, code, suffix1);
+    JSValue ret = JS_Eval(ctx, wrapped, total1 - 1, "<eval-async>",
                           JS_EVAL_TYPE_GLOBAL);
+    
+    if (JS_IsException(ret)) {
+      // SyntaxError — likely a statement (let/const/function/for/if).
+      // Fall back to statement mode without the return wrapper.
+      js_free(ctx, wrapped);
+      const char* prefix2 = "(async()=>{\n";
+      const char* suffix2 = "\n})()";
+      size_t total2 = strlen(prefix2) + n + strlen(suffix2) + 1;
+      wrapped = (char*)js_malloc(ctx, total2);
+      if (!wrapped) return JS_EXCEPTION;
+      snprintf(wrapped, total2, "%s%s%s", prefix2, code, suffix2);
+      ret = JS_Eval(ctx, wrapped, total2 - 1, "<eval-async>",
+                    JS_EVAL_TYPE_GLOBAL);
+    }
+    
     js_free(ctx, wrapped);
     if (JS_IsException(ret)) {
       qjs_dump_exception(ctx, ret);
