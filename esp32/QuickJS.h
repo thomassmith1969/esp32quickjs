@@ -26,6 +26,9 @@ class ESP32QuickJS;
 #include <algorithm>
 #include <vector>
 #include <string>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // Optional override for console.log output. main.cpp sets this to a
 // per-telnet-client Stream (or Serial) so console.log output goes to the
@@ -135,93 +138,203 @@ static void qjs_print_value_to(JSContext *ctx, JSValueConst v, Print* out) {
   JS_FreeValue(ctx, global);
 }
 
+// Non-blocking HTTP fetcher. All blocking I/O (HTTPClient::sendRequest/GET,
+// reading the response body) happens on a FreeRTOS task so the JS main loop
+// never stalls. The main loop just polls a "done" flag and resolves the
+// JS Promise when the background task has the full response.
 class JSHttpFetcher {
+ public:
   struct Entry {
-    HTTPClient *client;
+    JSContext *ctx;
     JSValue resolving_funcs[2];
+    // Input (set by JS thread before queuing):
+    std::string url;
+    std::string method;
+    std::string body;
+    // Output (written by task under mutex, read by JS thread):
+    volatile bool done;
+    volatile bool ok;       // true = success, false = error
     int status;
-    void result(JSContext *ctx, uint32_t func, JSValue body) {
-      delete client;  // dispose connection before invoke;
-      JSValue r = JS_NewObject(ctx);
-      JS_SetPropertyStr(ctx, r, "body", JS_DupValue(ctx, body));
-      JS_SetPropertyStr(ctx, r, "status", JS_NewInt32(ctx, status));
-      JS_Call(ctx, resolving_funcs[func], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-      JS_FreeValue(ctx, resolving_funcs[0]);
-      JS_FreeValue(ctx, resolving_funcs[1]);
-    }
+    std::string responseHeaders;
+    std::string responseBody;
+    std::string errorMsg;
   };
-  std::vector<Entry *> queue;
+
+ private:
+  std::vector<Entry *> queue;          // all pending entries (JS thread)
+  std::vector<Entry *> workQueue_;     // entries waiting for the task
+  TaskHandle_t task_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
+  SemaphoreHandle_t notify_ = nullptr;
+  volatile bool stopping_ = false;
+
+  static void taskEntry(void *arg) {
+    static_cast<JSHttpFetcher *>(arg)->fetchTask();
+    vTaskDelete(nullptr);
+  }
+
+  void fetchTask() {
+    while (true) {
+      xSemaphoreTake(notify_, portMAX_DELAY);
+      if (stopping_) break;
+      std::vector<Entry *> work;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      work.swap(workQueue_);
+      xSemaphoreGive(mutex_);
+      for (auto *e : work) doFetch(e);
+    }
+  }
+
+  void doFetch(Entry *e) {
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(10000);
+    if (!http.begin(e->url.c_str())) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->ok = false;
+      e->errorMsg = "begin() failed";
+      e->done = true;
+      xSemaphoreGive(mutex_);
+      return;
+    }
+    int code;
+    if (!e->method.empty() && e->method != "GET") {
+      code = http.sendRequest(e->method.c_str(),
+                             (uint8_t *)e->body.c_str(),
+                             e->body.length());
+    } else {
+      code = http.GET();
+    }
+    if (code <= 0) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->ok = false;
+      e->errorMsg = "HTTP error: " + std::to_string(code);
+      e->done = true;
+      xSemaphoreGive(mutex_);
+      http.end();
+      return;
+    }
+    String bodyStr = http.getString();
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    e->ok = true;
+    e->status = code;
+    e->responseBody = std::string(bodyStr.c_str());
+    e->done = true;
+    xSemaphoreGive(mutex_);
+    http.end();
+  }
 
  public:
+  JSHttpFetcher() {}
+
+  void init() {
+    if (task_) return;
+    mutex_ = xSemaphoreCreateMutex();
+    notify_ = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(taskEntry, "js_http", 8192, this, 1, &task_, 0);
+  }
+
+  ~JSHttpFetcher() {
+    stopping_ = true;
+    if (notify_) xSemaphoreGive(notify_);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (task_) { vTaskDelete(task_); task_ = nullptr; }
+    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
+    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
+    for (auto *e : queue) {
+      JS_FreeValue(e->ctx, e->resolving_funcs[0]);
+      JS_FreeValue(e->ctx, e->resolving_funcs[1]);
+      delete e;
+    }
+    queue.clear();
+  }
+
   JSValue fetch(JSContext *ctx, JSValueConst jsUrl, JSValueConst options) {
     if (WiFi.status() != WL_CONNECTED) {
-      return JS_EXCEPTION;
+      return JS_ThrowTypeError(ctx, "WiFi not connected");
     }
     const char *url = JS_ToCString(ctx, jsUrl);
-    if (!url) {
-      return JS_EXCEPTION;
-    }
-    const char *method = nullptr, *body = nullptr;
+    if (!url) return JS_EXCEPTION;
+
+    std::string method = "GET";
+    std::string body = "";
     if (JS_IsObject(options)) {
       JSValue m = JS_GetPropertyStr(ctx, options, "method");
       if (JS_IsString(m)) {
-        method = JS_ToCString(ctx, m);
+        const char *s = JS_ToCString(ctx, m);
+        if (s) { method = s; JS_FreeCString(ctx, s); }
       }
+      JS_FreeValue(ctx, m);
       JSValue b = JS_GetPropertyStr(ctx, options, "body");
-      if (JS_IsString(m)) {
-        body = JS_ToCString(ctx, b);
+      if (JS_IsString(b)) {
+        const char *s = JS_ToCString(ctx, b);
+        if (s) { body = s; JS_FreeCString(ctx, s); }
       }
+      JS_FreeValue(ctx, b);
     }
 
-    Entry *ent = new Entry();
-    ent->client = new HTTPClient();
-    ent->client->begin(url);
+    Entry *e = new Entry();
+    e->ctx = ctx;
+    e->url = url;
+    e->method = method;
+    e->body = body;
+    e->done = false;
+    e->ok = false;
+    e->status = 0;
+    e->resolving_funcs[0] = JS_UNDEFINED;
+    e->resolving_funcs[1] = JS_UNDEFINED;
     JS_FreeCString(ctx, url);
 
-    // TODO: remove blocking calls.
-    if (method) {
-      ent->status = ent->client->sendRequest(method, (uint8_t *)body,
-                                             body ? strlen(body) : 0);
-    } else {
-      ent->status = ent->client->GET();
+    JSValue promise = JS_NewPromiseCapability(ctx, e->resolving_funcs);
+    if (JS_IsException(promise)) {
+      delete e;
+      return JS_EXCEPTION;
     }
-    queue.push_back(ent);
 
-    JS_FreeCString(ctx, method);
-    JS_FreeCString(ctx, body);
-    return JS_NewPromiseCapability(ctx, ent->resolving_funcs);
+    // Queue for the background task.
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    queue.push_back(e);
+    workQueue_.push_back(e);
+    xSemaphoreGive(mutex_);
+    xSemaphoreGive(notify_);
+
+    return promise;
   }
 
   void loop(JSContext *ctx) {
-    int doneCount = 0;
-    for (auto &pent : queue) {
-      WiFiClient *stream = pent->client->getStreamPtr();
-      if (stream == nullptr || pent->status <= 0) {
-        // reject.
-        pent->result(ctx, 1, JS_UNDEFINED);
-        delete pent;
-        pent = nullptr;
-        doneCount++;
-        continue;
-      }
-      if (stream->available()) {
-        String body = pent->client->getString();
-        JSValue bodyStr = JS_NewString(ctx, body.c_str());
-        body.clear();
-        pent->result(ctx, 0, bodyStr);
-        JS_FreeValue(ctx, bodyStr);
-        delete pent;
-        pent = nullptr;
-        doneCount++;
-      }
-    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    auto it = queue.begin();
+    while (it != queue.end()) {
+      Entry *e = *it;
+      if (!e->done) { ++it; continue; }
 
-    if (doneCount > 0) {
-      queue.erase(std::remove_if(queue.begin(), queue.end(),
-                                 [](Entry *pent) { return pent == nullptr; }),
-                  queue.end());
+      bool ok = e->ok;
+      int status = e->status;
+      std::string body = e->responseBody;
+      std::string err = e->errorMsg;
+      JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
+      JSContext *ectx = e->ctx;
+      it = queue.erase(it);
+      xSemaphoreGive(mutex_);
+
+      if (ok) {
+        JSValue r = JS_NewObject(ectx);
+        JS_SetPropertyStr(ectx, r, "status", JS_NewInt32(ectx, status));
+        JS_SetPropertyStr(ectx, r, "body", JS_NewString(ectx, body.c_str()));
+        JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &r);
+        JS_FreeValue(ectx, r);
+      } else {
+        JSValue errv = JS_NewString(ectx, err.c_str());
+        JS_Call(ectx, rfs[1], JS_UNDEFINED, 1, &errv);
+        JS_FreeValue(ectx, errv);
+      }
+      JS_FreeValue(ectx, rfs[0]);
+      JS_FreeValue(ectx, rfs[1]);
+      delete e;
+
+      xSemaphoreTake(mutex_, portMAX_DELAY);
     }
+    xSemaphoreGive(mutex_);
   }
 };
 
@@ -2786,6 +2899,8 @@ class ESP32QuickJS {
     JS_FreeValue(ctx, global);
     // Initialize the non-blocking module loader (spawns FreeRTOS reader task).
     module_loader.init(ctx);
+    // Initialize the non-blocking HTTP fetcher (spawns FreeRTOS task).
+    httpFetcher.init();
     analog.init();
     JSI2C::instance = &i2c;
     JSSPI::instance = &spi;
@@ -3877,6 +3992,10 @@ class ESP32QuickJS {
     };
     JS_SetPropertyFunctionList(ctx, wifi, wifi_funcs, sizeof(wifi_funcs) / sizeof(JSCFunctionListEntry));
     // Do not free wifi here, it is owned by the global object
+
+    // Expose fetch as a global function (alias of WiFi.fetch).
+    JS_SetPropertyStr(ctx, global, "fetch",
+                      JS_NewCFunction(ctx, http_fetch, "fetch", 2));
 
     // FS = { LittleFS: { readFile, writeFile, removeFile, listFiles },
     //        SD:       { init, readFile, writeFile, removeFile, listFiles } }
