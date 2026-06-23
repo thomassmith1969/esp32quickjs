@@ -142,6 +142,92 @@ static void qjs_print_value_to(JSContext *ctx, JSValueConst v, Print* out) {
   JS_FreeValue(ctx, global);
 }
 
+// ---- Centralized background worker ----
+// One FreeRTOS task, one mutex, one binary semaphore. Multiple modules
+// (I2C, SPI, FileSystem) submit work items via submit(). Each item carries
+// a tag identifying the owner and a function pointer to the processing
+// callback. The worker task pops items, calls the callback, and marks
+// them done. Each module's loop() polls its own doneQueue_.
+//
+// This replaces the per-module task approach which created 3-4 separate
+// tasks (each 4KB stack = 12-16KB heap) and caused HTTPS to fail due to
+// insufficient contiguous heap for SSL BIGNUM allocation.
+class JSWorker {
+ public:
+  typedef void (*ProcessFn)(void *entry);
+
+  struct WorkItem {
+    void *entry;        // module-specific Entry* (opaque to JSWorker)
+    ProcessFn fn;       // module's processEntry function
+    volatile bool done; // set by worker after fn returns
+  };
+
+ private:
+  TaskHandle_t task_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
+  SemaphoreHandle_t notify_ = nullptr;
+  volatile bool stopping_ = false;
+  std::vector<WorkItem *> workQueue_;  // pending items (worker pops)
+
+  static void taskEntry(void *arg) {
+    static_cast<JSWorker *>(arg)->workerTask();
+    vTaskDelete(nullptr);
+  }
+
+  void workerTask() {
+    while (true) {
+      xSemaphoreTake(notify_, portMAX_DELAY);
+      if (stopping_) break;
+      std::vector<WorkItem *> work;
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      work.swap(workQueue_);
+      xSemaphoreGive(mutex_);
+      for (auto *w : work) {
+        w->fn(w->entry);  // module's processEntry fills in results
+        w->done = true;
+      }
+    }
+  }
+
+ public:
+  void init() {
+    if (task_) return;
+    mutex_ = xSemaphoreCreateMutex();
+    notify_ = xSemaphoreCreateBinary();
+    // 8KB stack — enough for I2C, SPI, FS, and HTTP operations.
+    xTaskCreatePinnedToCore(taskEntry, "js_worker", 8192, this, 1, &task_, 0);
+  }
+
+  // Submit a work item. The module owns the Entry; JSWorker owns the
+  // WorkItem (freed after done is set). The module's loop() polls
+  // item->done and then resolves the JS Promise.
+  void submit(WorkItem *item) {
+    item->done = false;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    workQueue_.push_back(item);
+    xSemaphoreGive(mutex_);
+    xSemaphoreGive(notify_);
+  }
+
+  bool ready() const { return task_ != nullptr; }
+
+  void end() {
+    stopping_ = true;
+    if (notify_) xSemaphoreGive(notify_);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (task_) { vTaskDelete(task_); task_ = nullptr; }
+    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
+    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
+    stopping_ = false;
+  }
+
+  ~JSWorker() { end(); }
+
+  // Singleton instance — set by ESP32QuickJS::begin().
+  static JSWorker *instance;
+};
+inline JSWorker* JSWorker::instance = nullptr;
+
 // Non-blocking HTTP fetcher. All blocking I/O (HTTPClient::sendRequest/GET,
 // reading the response body) happens on a FreeRTOS task so the JS main loop
 // never stalls. The main loop just polls a "done" flag and resolves the
@@ -1129,17 +1215,19 @@ class JSI2C {
     int rlen;
     int mode;  // 0=string, 1=array, 2=hex
     // OP_OPEN-only: parameters captured at call time so the actual driver
-    // install runs from the task (non-blocking wrt the JS engine).
+    // install runs from the worker (non-blocking wrt the JS engine).
     int sda, scl;
     uint32_t freq;
-    int busHandle;   // set by task for OP_OPEN result
+    int busHandle;   // set by worker for OP_OPEN result
     int busIdx;      // bus index for OP_CLOSE
     JSValue resolving_funcs[2];
-    // Output (written by task, read by JS thread):
+    // Output (written by worker, read by JS thread):
     volatile bool done;
     volatile bool ok;       // true = success, false = error
     esp_err_t result;
     std::vector<uint8_t> rx;
+    // JSWorker linkage:
+    JSWorker::WorkItem *workItem;  // owned by JSWorker, freed after done
   };
 
   struct Bus {
@@ -1151,37 +1239,22 @@ class JSI2C {
 
   JSI2C() = default;
 
-  // ---- Background task infrastructure (mirrors JSHttpFetcher) ----
+  // ---- Uses the shared JSWorker (no per-module task) ----
  private:
-  TaskHandle_t task_ = nullptr;
-  SemaphoreHandle_t mutex_ = nullptr;
-  SemaphoreHandle_t notify_ = nullptr;
-  volatile bool stopping_ = false;
-  std::vector<Entry*> doneQueue_;  // completed entries (read by JS thread)
+  std::vector<Entry*> queue;       // all pending entries (JS thread tracks)
 
-  static void taskEntry(void *arg) {
-    static_cast<JSI2C *>(arg)->workerTask();
-    vTaskDelete(nullptr);
+  // Static processEntry wrapper for JSWorker callback.
+  static void processEntryCb(void *arg) {
+    Entry *e = static_cast<Entry *>(arg);
+    instance->processEntry(e);
   }
 
-  void workerTask() {
-    while (true) {
-      xSemaphoreTake(notify_, portMAX_DELAY);
-      if (stopping_) break;
-      std::vector<Entry*> work;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      work.swap(workQueue_);
-      xSemaphoreGive(mutex_);
-      for (auto *e : work) processEntry(e);
-    }
-  }
-
-  // Runs on the background task. Does all blocking I2C calls and writes
-  // results back into the Entry. The JS thread resolves Promises in loop().
+  // Runs on the shared worker thread. Does all blocking I2C calls and
+  // writes results back into the Entry. No mutex needed — the JS thread
+  // only reads volatile done flag via workItem. The worker sets
+  // workItem->done = true after this returns.
   void processEntry(Entry *e) {
     if (e->kind == OP_OPEN) {
-      // Idempotent: if a bus with the same sda/scl/freq is already
-      // installed, reuse that handle instead of installing again.
       int existing = -1;
       for (size_t i = 0; i < buses.size(); i++) {
         Bus &b = buses[i];
@@ -1195,20 +1268,12 @@ class JSI2C {
         e->ok = true;
         e->busHandle = existing;
         e->result = ESP_OK;
-        xSemaphoreTake(mutex_, portMAX_DELAY);
-        e->done = true;
-        doneQueue_.push_back(e);
-        xSemaphoreGive(mutex_);
         return;
       }
       esp_err_t r1 = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
       if (r1 != ESP_OK) {
         e->ok = false;
         e->result = r1;
-        xSemaphoreTake(mutex_, portMAX_DELAY);
-        e->done = true;
-        doneQueue_.push_back(e);
-        xSemaphoreGive(mutex_);
         return;
       }
       esp_err_t r2 = i2c_set_pin(I2C_NUM_0, e->sda, e->scl,
@@ -1218,10 +1283,6 @@ class JSI2C {
         i2c_driver_delete(I2C_NUM_0);
         e->ok = false;
         e->result = r2;
-        xSemaphoreTake(mutex_, portMAX_DELAY);
-        e->done = true;
-        doneQueue_.push_back(e);
-        xSemaphoreGive(mutex_);
         return;
       }
       Bus bus;
@@ -1234,10 +1295,6 @@ class JSI2C {
       e->ok = true;
       e->busHandle = (int)(buses.size() - 1);
       e->result = ESP_OK;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->done = true;
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
       return;
     }
 
@@ -1251,14 +1308,9 @@ class JSI2C {
         e->ok = false;
         e->result = ESP_ERR_INVALID_ARG;
       }
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->done = true;
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
       return;
     }
 
-    // OP_WRITE / OP_READ / OP_WRITE_READ — find an installed bus.
     Bus *b = nullptr;
     for (auto &bus : buses) {
       if (bus.installed) { b = &bus; break; }
@@ -1266,10 +1318,6 @@ class JSI2C {
     if (!b) {
       e->ok = false;
       e->result = ESP_ERR_NOT_FOUND;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->done = true;
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
       return;
     }
 
@@ -1294,29 +1342,20 @@ class JSI2C {
     e->result = res;
     e->ok = (res == ESP_OK);
     if (res == ESP_OK) e->rx = std::move(rx);
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    e->done = true;
-    doneQueue_.push_back(e);
-    xSemaphoreGive(mutex_);
   }
 
  public:
-  void init() {
-    if (task_) return;
-    mutex_ = xSemaphoreCreateMutex();
-    notify_ = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(taskEntry, "js_i2c", 4096, this, 1, &task_, 0);
-  }
+  // No per-module init — uses the shared JSWorker.
+  void init() {}
 
-  // Returns true if a queued entry was processed this tick.
+  // Scan queue for completed entries (workItem->done) and resolve Promises.
   bool loop(JSContext* ctx) {
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    if (doneQueue_.empty()) { xSemaphoreGive(mutex_); return false; }
-    std::vector<Entry*> ready;
-    ready.swap(doneQueue_);
-    xSemaphoreGive(mutex_);
+    bool any = false;
+    auto it = queue.begin();
+    while (it != queue.end()) {
+      Entry *e = *it;
+      if (!e->workItem || !e->workItem->done) { ++it; continue; }
 
-    for (Entry *e : ready) {
       bool ok = e->ok;
       esp_err_t res = e->result;
       int mode = e->mode;
@@ -1325,6 +1364,8 @@ class JSI2C {
       std::vector<uint8_t> rx = std::move(e->rx);
       JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
       JSContext *ectx = ctx;
+      it = queue.erase(it);
+      any = true;
 
       if (ok) {
         JSValue r;
@@ -1359,49 +1400,30 @@ class JSI2C {
       }
       JS_FreeValue(ectx, rfs[0]);
       JS_FreeValue(ectx, rfs[1]);
+      delete e->workItem;
       delete e;
     }
-    return true;
+    return any;
   }
 
   void end(JSContext* ctx) {
-    // Stop the background task first.
-    stopping_ = true;
-    if (notify_) xSemaphoreGive(notify_);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if (task_) { vTaskDelete(task_); task_ = nullptr; }
-
-    // Reject any still-pending entries (never picked up by the task).
-    xSemaphoreTake(mutex_, portMAX_DELAY);
+    // Reject any still-pending entries.
     for (auto *e : queue) {
       JSValue r = JS_UNDEFINED;
       JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
       JS_FreeValue(ctx, r);
       JS_FreeValue(ctx, e->resolving_funcs[0]);
       JS_FreeValue(ctx, e->resolving_funcs[1]);
+      if (e->workItem) delete e->workItem;
       delete e;
     }
     queue.clear();
-    for (auto *e : doneQueue_) {
-      JSValue r = JS_UNDEFINED;
-      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-      JS_FreeValue(ctx, e->resolving_funcs[0]);
-      JS_FreeValue(ctx, e->resolving_funcs[1]);
-      delete e;
-    }
-    doneQueue_.clear();
-    xSemaphoreGive(mutex_);
 
     for (auto& b : buses) {
       if (b.installed) i2c_driver_delete(b.port);
       b.installed = false;
     }
     buses.clear();
-
-    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
-    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
-    stopping_ = false;
   }
 
   // ---- static JS trampolines (called from the C function list) ----
@@ -1453,11 +1475,9 @@ class JSI2C {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSI2C::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -1482,11 +1502,9 @@ class JSI2C {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSI2C::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -1529,11 +1547,9 @@ class JSI2C {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSI2C::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -1582,11 +1598,9 @@ class JSI2C {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSI2C::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -1640,11 +1654,9 @@ class JSI2C {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSI2C::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -1710,8 +1722,6 @@ class JSI2C {
 
  private:
   std::vector<Bus> buses;
-  std::vector<Entry*> queue;          // all pending entries (JS thread)
-  std::vector<Entry*> workQueue_;     // entries waiting for the task
 };
 inline JSI2C* JSI2C::instance = nullptr;
 
@@ -1742,18 +1752,20 @@ class JSSPI {
     int rlen;
     int mode;         // 0=string, 1=array, 2=hex
     // OP_OPEN-only: parameters captured at call time. The actual
-    // spi_bus_initialize + spi_bus_add_device run from the task so the
+    // spi_bus_initialize + spi_bus_add_device run from the worker so the
     // JS engine is never blocked.
     int sck, miso, mosi, cs;
     uint32_t freq;
     uint8_t spimode;
-    int devHandle;    // set by task for OP_OPEN result
+    int devHandle;    // set by worker for OP_OPEN result
     JSValue resolving_funcs[2];
-    // Output (written by task, read by JS thread):
+    // Output (written by worker, read by JS thread):
     volatile bool done;
     volatile bool ok;       // true = success, false = error
     esp_err_t result;
     std::vector<uint8_t> rx;
+    // JSWorker linkage:
+    JSWorker::WorkItem *workItem;
   };
 
   struct Device {
@@ -1767,33 +1779,16 @@ class JSSPI {
 
   JSSPI() = default;
 
-  // ---- Background task infrastructure (mirrors JSHttpFetcher) ----
+  // ---- Uses the shared JSWorker (no per-module task) ----
  private:
-  TaskHandle_t task_ = nullptr;
-  SemaphoreHandle_t mutex_ = nullptr;
-  SemaphoreHandle_t notify_ = nullptr;
-  volatile bool stopping_ = false;
-  std::vector<Entry*> doneQueue_;  // completed entries (read by JS thread)
+  std::vector<Entry*> queue;       // all pending entries (JS thread tracks)
 
-  static void taskEntry(void *arg) {
-    static_cast<JSSPI *>(arg)->workerTask();
-    vTaskDelete(nullptr);
+  static void processEntryCb(void *arg) {
+    Entry *e = static_cast<Entry *>(arg);
+    instance->processEntry(e);
   }
 
-  void workerTask() {
-    while (true) {
-      xSemaphoreTake(notify_, portMAX_DELAY);
-      if (stopping_) break;
-      std::vector<Entry*> work;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      work.swap(workQueue_);
-      xSemaphoreGive(mutex_);
-      for (auto *e : work) processEntry(e);
-    }
-  }
-
-  // Runs on the background task. Does all blocking SPI calls and writes
-  // results back into the Entry. The JS thread resolves Promises in loop().
+  // Runs on the shared worker thread. Does all blocking SPI calls.
   void processEntry(Entry *e) {
     if (e->kind == OP_OPEN) {
       Device d;
@@ -1814,7 +1809,7 @@ class JSSPI {
 
       esp_err_t ires = spi_bus_initialize(d.host, &buscfg, SPI_DMA_CH_AUTO);
       if (ires == ESP_ERR_INVALID_STATE) {
-        d.bus_initialized = false;  // someone else owns the bus
+        d.bus_initialized = false;
       } else if (ires != ESP_OK) {
         ires = spi_bus_initialize(d.host, &buscfg, SPI_DMA_DISABLED);
         if (ires == ESP_ERR_INVALID_STATE) {
@@ -1822,10 +1817,6 @@ class JSSPI {
         } else if (ires != ESP_OK) {
           e->ok = false;
           e->result = ires;
-          xSemaphoreTake(mutex_, portMAX_DELAY);
-          e->done = true;
-          doneQueue_.push_back(e);
-          xSemaphoreGive(mutex_);
           return;
         } else {
           d.bus_initialized = true;
@@ -1846,10 +1837,6 @@ class JSSPI {
         if (d.bus_initialized) spi_bus_free(d.host);
         e->ok = false;
         e->result = ires;
-        xSemaphoreTake(mutex_, portMAX_DELAY);
-        e->done = true;
-        doneQueue_.push_back(e);
-        xSemaphoreGive(mutex_);
         return;
       }
       d.handle = handle;
@@ -1857,10 +1844,6 @@ class JSSPI {
       e->ok = true;
       e->devHandle = (int)(devices.size() - 1);
       e->result = ESP_OK;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->done = true;
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
       return;
     }
 
@@ -1879,22 +1862,13 @@ class JSSPI {
         e->ok = false;
         e->result = ESP_ERR_INVALID_ARG;
       }
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->done = true;
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
       return;
     }
 
-    // OP_TRANSFER / OP_WRITE / OP_READ
     if (e->devIdx < 0 || e->devIdx >= (int)devices.size() ||
         !devices[e->devIdx].handle) {
       e->ok = false;
       e->result = ESP_ERR_NOT_FOUND;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->done = true;
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
       return;
     }
     spi_device_handle_t h = devices[e->devIdx].handle;
@@ -1922,28 +1896,18 @@ class JSSPI {
     e->result = res;
     e->ok = (res == ESP_OK);
     if (res == ESP_OK) e->rx = std::move(rx);
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    e->done = true;
-    doneQueue_.push_back(e);
-    xSemaphoreGive(mutex_);
   }
 
  public:
-  void init() {
-    if (task_) return;
-    mutex_ = xSemaphoreCreateMutex();
-    notify_ = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(taskEntry, "js_spi", 4096, this, 1, &task_, 0);
-  }
+  void init() {}
 
   bool loop(JSContext* ctx) {
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    if (doneQueue_.empty()) { xSemaphoreGive(mutex_); return false; }
-    std::vector<Entry*> ready;
-    ready.swap(doneQueue_);
-    xSemaphoreGive(mutex_);
+    bool any = false;
+    auto it = queue.begin();
+    while (it != queue.end()) {
+      Entry *e = *it;
+      if (!e->workItem || !e->workItem->done) { ++it; continue; }
 
-    for (Entry *e : ready) {
       bool ok = e->ok;
       esp_err_t res = e->result;
       int mode = e->mode;
@@ -1952,6 +1916,8 @@ class JSSPI {
       std::vector<uint8_t> rx = std::move(e->rx);
       JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
       JSContext *ectx = ctx;
+      it = queue.erase(it);
+      any = true;
 
       if (ok) {
         JSValue r;
@@ -1986,39 +1952,23 @@ class JSSPI {
       }
       JS_FreeValue(ectx, rfs[0]);
       JS_FreeValue(ectx, rfs[1]);
+      delete e->workItem;
       delete e;
     }
-    return true;
+    return any;
   }
 
   void end(JSContext* ctx) {
-    // Stop the background task first.
-    stopping_ = true;
-    if (notify_) xSemaphoreGive(notify_);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if (task_) { vTaskDelete(task_); task_ = nullptr; }
-
-    // Reject any still-pending entries (never picked up by the task).
-    xSemaphoreTake(mutex_, portMAX_DELAY);
     for (auto *e : queue) {
       JSValue r = JS_UNDEFINED;
       JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
       JS_FreeValue(ctx, r);
       JS_FreeValue(ctx, e->resolving_funcs[0]);
       JS_FreeValue(ctx, e->resolving_funcs[1]);
+      if (e->workItem) delete e->workItem;
       delete e;
     }
     queue.clear();
-    for (auto *e : doneQueue_) {
-      JSValue r = JS_UNDEFINED;
-      JS_Call(ctx, e->resolving_funcs[1], JS_UNDEFINED, 1, &r);
-      JS_FreeValue(ctx, r);
-      JS_FreeValue(ctx, e->resolving_funcs[0]);
-      JS_FreeValue(ctx, e->resolving_funcs[1]);
-      delete e;
-    }
-    doneQueue_.clear();
-    xSemaphoreGive(mutex_);
 
     for (auto& d : devices) {
       if (d.handle) {
@@ -2031,10 +1981,6 @@ class JSSPI {
       }
     }
     devices.clear();
-
-    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
-    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
-    stopping_ = false;
   }
 
   // ---- static JS trampolines (called from the C function list) ----
@@ -2097,11 +2043,9 @@ class JSSPI {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSSPI::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -2126,11 +2070,9 @@ class JSSPI {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSSPI::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -2177,11 +2119,9 @@ class JSSPI {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSSPI::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -2217,11 +2157,9 @@ class JSSPI {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSSPI::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -2265,11 +2203,9 @@ class JSSPI {
     e.resolving_funcs[0] = resolving_funcs[0];
     e.resolving_funcs[1] = resolving_funcs[1];
     Entry *ep = new Entry(std::move(e));
-    xSemaphoreTake(instance->mutex_, portMAX_DELAY);
+    ep->workItem = new JSWorker::WorkItem{ep, &JSSPI::processEntryCb, false};
     instance->queue.push_back(ep);
-    instance->workQueue_.push_back(ep);
-    xSemaphoreGive(instance->mutex_);
-    xSemaphoreGive(instance->notify_);
+    JSWorker::instance->submit(ep->workItem);
     return promise;
   }
 
@@ -2300,8 +2236,6 @@ class JSSPI {
 
  private:
   std::vector<Device> devices;
-  std::vector<Entry*> queue;          // all pending entries (JS thread)
-  std::vector<Entry*> workQueue_;     // entries waiting for the task
 };
 inline JSSPI* JSSPI::instance = nullptr;
 
@@ -2690,51 +2624,28 @@ class JSFileSystem {
     std::string path;
     std::string content;  // used for OP_WRITE
     JSValue resolving_funcs[2];
-    // Result (filled by task, read by loop):
+    // Result (filled by worker, read by loop):
     volatile bool done;
     volatile bool ok;
     std::string result;  // read content or list text
     std::string error;   // error message on failure
+    // JSWorker linkage:
+    JSWorker::WorkItem *workItem;
   };
 
  private:
-  std::vector<Entry *> queue;       // pending entries (task pops from here)
-  std::vector<Entry *> doneQueue_;  // completed entries (loop pops from here)
+  std::vector<Entry *> queue;       // all pending entries (JS thread tracks)
   fs::FS *defaultFs = nullptr;
-  TaskHandle_t task_ = nullptr;
-  SemaphoreHandle_t mutex_ = nullptr;
-  SemaphoreHandle_t notify_ = nullptr;
-  volatile bool stopping_ = false;
 
-  static void taskEntry(void *arg) {
-    static_cast<JSFileSystem *>(arg)->workerTask();
-    vTaskDelete(nullptr);
+  static void processEntryCb(void *arg) {
+    Entry *e = static_cast<Entry *>(arg);
+    processEntry(e);
   }
 
-  void workerTask() {
-    while (true) {
-      xSemaphoreTake(notify_, portMAX_DELAY);
-      if (stopping_) break;
-
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      if (queue.empty()) { xSemaphoreGive(mutex_); continue; }
-      Entry *e = queue.front();
-      queue.erase(queue.begin());
-      xSemaphoreGive(mutex_);
-
-      processEntry(e);
-
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      doneQueue_.push_back(e);
-      xSemaphoreGive(mutex_);
-    }
-  }
-
-  void processEntry(Entry *e) {
+  static void processEntry(Entry *e) {
     e->ok = false;
     if (!e->fs) {
       e->error = "filesystem unbound";
-      e->done = true;
       return;
     }
     switch (e->op) {
@@ -2811,21 +2722,13 @@ class JSFileSystem {
         break;
       }
     }
-    e->done = true;
   }
 
  public:
-  // Bind a backing fs::FS (LittleFS, SD, ...). Use nullptr to detach.
   void bind(fs::FS *fs) { defaultFs = fs; }
   fs::FS *bound() const { return defaultFs; }
 
-  void init() {
-    if (task_) return;
-    mutex_ = xSemaphoreCreateMutex();
-    notify_ = xSemaphoreCreateBinary();
-    // 4KB stack — file I/O doesn't need much.
-    xTaskCreatePinnedToCore(taskEntry, "js_fs", 4096, this, 1, &task_, 0);
-  }
+  void init() {}
 
   JSValue op(JSContext *ctx, Op op_, const char *path, const char *content) {
     if (!defaultFs) {
@@ -2845,25 +2748,23 @@ class JSFileSystem {
     if (content) e->content = content;
     e->done = false;
     e->ok = false;
+    e->workItem = nullptr;
     JSValue promise = JS_NewPromiseCapability(ctx, e->resolving_funcs);
 
-    xSemaphoreTake(mutex_, portMAX_DELAY);
+    e->workItem = new JSWorker::WorkItem{e, &JSFileSystem::processEntryCb, false};
     queue.push_back(e);
-    xSemaphoreGive(mutex_);
-    xSemaphoreGive(notify_);
+    JSWorker::instance->submit(e->workItem);
 
     return promise;
   }
 
-  // Called from the main loop. Resolves/rejects Promises for completed
-  // entries. Never blocks.
+  // Called from the main loop. Scans queue for completed entries.
   void loop(JSContext *ctx) {
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    std::vector<Entry *> done;
-    done.swap(doneQueue_);
-    xSemaphoreGive(mutex_);
+    auto it = queue.begin();
+    while (it != queue.end()) {
+      Entry *e = *it;
+      if (!e->workItem || !e->workItem->done) { ++it; continue; }
 
-    for (Entry *e : done) {
       if (e->ok) {
         JSValue val = JS_NewString(ctx, e->result.c_str());
         JS_Call(ctx, e->resolving_funcs[0], JS_UNDEFINED, 1, &val);
@@ -2875,24 +2776,18 @@ class JSFileSystem {
       }
       JS_FreeValue(ctx, e->resolving_funcs[0]);
       JS_FreeValue(ctx, e->resolving_funcs[1]);
+      it = queue.erase(it);
+      delete e->workItem;
       delete e;
     }
   }
 
   void end() {
-    stopping_ = true;
-    if (notify_) xSemaphoreGive(notify_);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if (task_) { vTaskDelete(task_); task_ = nullptr; }
-    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
-    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
-    // Note: we can't free JSValues here because we don't have ctx.
-    // Pending entries are abandoned; their Promises will never settle.
-    // This is only called during shutdown, so it's acceptable.
-    for (auto *e : queue) delete e;
+    for (auto *e : queue) {
+      if (e->workItem) delete e->workItem;
+      delete e;
+    }
     queue.clear();
-    for (auto *e : doneQueue_) delete e;
-    doneQueue_.clear();
   }
 };
 
@@ -3226,6 +3121,7 @@ class ESP32QuickJS {
   // Analog I/O and touch listeners. Always available (no feature
   // flag — uses on-chip ADC / LEDC / touch hardware).
   JSAnalog analog;
+  JSWorker worker;          // centralized background task for I2C/SPI/FS
   JSHttpFetcher httpFetcher;
   JSWebServer webServer;
   // DNS captive portal server (WiFi.startDNS) and mDNS (WiFi.startMDNS).
@@ -3336,15 +3232,17 @@ class ESP32QuickJS {
     JS_FreeValue(ctx, global);
     // Initialize the non-blocking module loader (spawns FreeRTOS reader task).
     module_loader.init(ctx);
+    // Initialize the centralized worker (one task for I2C/SPI/FS).
+    JSWorker::instance = &worker;
+    worker.init();
     // Initialize the non-blocking HTTP fetcher (spawns FreeRTOS task).
     httpFetcher.init();
     analog.init();
     JSI2C::instance = &i2c;
     JSSPI::instance = &spi;
+    // I2C/SPI/FS no longer spawn their own tasks — they use the shared worker.
     i2c.init();
     spi.init();
-    // Initialize the non-blocking filesystem tasks (LittleFS + SD share
-    // the same JSFileSystem class, each gets its own task).
     littlefs.init();
     sd.init();
     JSServo::instance = &servo;
