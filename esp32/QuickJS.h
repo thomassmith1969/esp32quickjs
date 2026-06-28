@@ -392,20 +392,25 @@ class JSHttpFetcher {
   }
 
   void loop(JSContext *ctx) {
+    std::vector<Entry*> doneEntries;
     xSemaphoreTake(mutex_, portMAX_DELAY);
-    auto it = queue.begin();
-    while (it != queue.end()) {
-      Entry *e = *it;
-      if (!e->done) { ++it; continue; }
+    for (auto it = queue.begin(); it != queue.end(); ) {
+      if ((*it)->done) {
+        doneEntries.push_back(*it);
+        it = queue.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    xSemaphoreGive(mutex_);
 
+    for (auto e : doneEntries) {
       bool ok = e->ok;
       int status = e->status;
       std::string body = e->responseBody;
       std::string err = e->errorMsg;
       JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
       JSContext *ectx = e->ctx;
-      it = queue.erase(it);
-      xSemaphoreGive(mutex_);
 
       if (ok) {
         JSValue r = JS_NewObject(ectx);
@@ -421,10 +426,7 @@ class JSHttpFetcher {
       JS_FreeValue(ectx, rfs[0]);
       JS_FreeValue(ectx, rfs[1]);
       delete e;
-
-      xSemaphoreTake(mutex_, portMAX_DELAY);
     }
-    xSemaphoreGive(mutex_);
   }
 };
 
