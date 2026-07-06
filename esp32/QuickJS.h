@@ -3179,6 +3179,34 @@ class ESP32QuickJS {
   TaskHandle_t scanTask_ = nullptr;
   SemaphoreHandle_t scanMutex_ = nullptr;
 
+  // ---- RTTTL player (non-blocking, driven by loop() tick) ----
+  // playRTTTL(pin, rtttlString, [onComplete]) parses the RTTTL into
+  // a note list, starts the first note via analog.js_writeAnalog,
+  // and advances through notes from loop() based on millis() timing.
+  // One RTTTLState per pin — multiple pins can play simultaneously
+  // (polyphonic). If any write function (servoWrite/tone/analogWrite)
+  // is called on the same pin, that pin's gen is bumped and its
+  // playback aborts immediately.
+  struct RTTTLState {
+    uint8_t pin = 0xFF;
+    bool active = false;
+    uint32_t gen = 0;       // bumped to abort playback
+    uint32_t startGen = 0;  // gen captured at start, checked each tick
+    size_t noteIdx = 0;
+    uint32_t noteStartMs = 0;
+    JSValue onComplete = JS_UNDEFINED;
+    std::vector<std::pair<uint32_t, uint32_t>> notes;  // (freq, durationMs), freq=0 = rest
+  };
+  std::vector<RTTTLState> rtttlPlayers;
+
+  // Find the RTTTL player for a given pin, or nullptr if none active.
+  RTTTLState *rtttlFind(uint8_t pin) {
+    for (auto &p : rtttlPlayers) {
+      if (p.active && p.pin == pin) return &p;
+    }
+    return nullptr;
+  }
+
   void scanTaskFunc() {
     // Runs on a separate FreeRTOS task — blocking is OK here.
     int n = WiFi.scanNetworks(false, false, false, scanResult_ ? scanResult_->timeoutMs : 300);
@@ -3258,6 +3286,19 @@ class ESP32QuickJS {
   }
 
   void end() {
+    // Abort all RTTTL playbacks and free onComplete callbacks.
+    for (auto &p : rtttlPlayers) {
+      if (p.active) {
+        p.active = false;
+        p.gen++;
+        if (!JS_IsUndefined(p.onComplete)) {
+          JS_FreeValue(ctx, p.onComplete);
+          p.onComplete = JS_UNDEFINED;
+        }
+        p.notes.clear();
+      }
+    }
+    rtttlPlayers.clear();
     timer.RemoveAll(ctx);
     analog.end(ctx);
     i2c.end(ctx);
@@ -3358,6 +3399,53 @@ class ESP32QuickJS {
       delete scanResult_;
       scanResult_ = nullptr;
       xSemaphoreGive(scanMutex_);
+    }
+
+    // ---- RTTTL playback tick (per-pin, polyphonic) ----
+    // Advance through notes for each active player based on millis()
+    // timing. Each note's frequency is driven via analog.js_writeAnalog
+    // (50% duty, 10-bit). Rests (freq=0) turn the pin off via
+    // detachPwmIfAttached. If a player's gen != startGen, it was
+    // aborted by a write function on that pin — stop silently.
+    // (Reuses `now` already declared at top of loop().)
+    for (auto &p : rtttlPlayers) {
+      if (!p.active || p.gen != p.startGen) continue;
+      if (p.noteIdx >= p.notes.size()) continue;
+      uint32_t dur = p.notes[p.noteIdx].second;
+      if (now - p.noteStartMs < dur) continue;
+      // Advance to next note.
+      p.noteIdx++;
+      p.noteStartMs = now;
+      if (p.noteIdx < p.notes.size()) {
+        uint32_t freq = p.notes[p.noteIdx].first;
+        if (freq == 0) {
+          // Rest — turn off PWM.
+          analog.detachPwmIfAttached(p.pin);
+        } else {
+          // Play note — 50% duty, 10-bit, via js_writeAnalog.
+          JSValue wargv[4] = {
+            JS_NewUint32(ctx, p.pin),
+            JS_NewUint32(ctx, 511),
+            JS_NewUint32(ctx, freq),
+            JS_NewUint32(ctx, 10),
+          };
+          JSValue ret = analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
+          for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
+          JS_FreeValue(ctx, ret);
+        }
+      } else {
+        // Finished — fire onComplete, clean up.
+        p.active = false;
+        analog.detachPwmIfAttached(p.pin);
+        if (!JS_IsUndefined(p.onComplete)) {
+          JSValue ret = JS_Call(ctx, p.onComplete, JS_UNDEFINED, 0, nullptr);
+          if (JS_IsException(ret)) qjs_dump_exception(ctx, ret);
+          JS_FreeValue(ctx, ret);
+          JS_FreeValue(ctx, p.onComplete);
+          p.onComplete = JS_UNDEFINED;
+        }
+        p.notes.clear();
+      }
     }
 
     // loop()
@@ -4614,17 +4702,17 @@ class ESP32QuickJS {
         JSCFunctionListEntry{"servoWrite", 0, JS_DEF_CFUNC, 0, {
                                func : {2, JS_CFUNC_generic, esp32_servo_write}
                              }},
+        JSCFunctionListEntry{"tone", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, esp32_tone}
+                             }},
+        JSCFunctionListEntry{"playRTTTL", 0, JS_DEF_CFUNC, 0, {
+                               func : {3, JS_CFUNC_generic, esp32_play_rtttl}
+                             }},
         JSCFunctionListEntry{"deepSleep", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_deep_sleep}
                              }},
         JSCFunctionListEntry{"setLoop", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_set_loop}
-                             }},
-        JSCFunctionListEntry{"tone", 0, JS_DEF_CFUNC, 0, {
-                               func : {3, JS_CFUNC_generic, esp32_tone}
-                             }},
-        JSCFunctionListEntry{"noTone", 0, JS_DEF_CFUNC, 0, {
-                               func : {1, JS_CFUNC_generic, esp32_no_tone}
                              }},
         JSCFunctionListEntry{"dacWrite", 0, JS_DEF_CFUNC, 0, {
                                func : {2, JS_CFUNC_generic, esp32_dac_write}
@@ -5101,6 +5189,10 @@ class ESP32QuickJS {
 
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
 
+    // Abort RTTTL if playing on this pin.
+    RTTTLState *rt = qjs->rtttlFind((uint8_t)pin);
+    if (rt) rt->gen++;
+
     JSValue wargv[4] = {
       JS_DupValue(ctx, argv[0]),
       JS_NewUint32(ctx, duty),
@@ -5111,6 +5203,35 @@ class ESP32QuickJS {
     for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
     return ret;
   }
+
+  // esp32.tone(pin, frequency) → Promise<void>
+  // Square-wave tone via the LEDC pool (50% duty, 10-bit).
+  static JSValue esp32_tone(JSContext *ctx, JSValueConst jsThis, int argc,
+                            JSValueConst *argv) {
+    if (argc < 2) {
+      return JS_ThrowTypeError(ctx, "tone: need (pin, frequency)");
+    }
+    uint32_t pin, frequency;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    JS_ToUint32(ctx, &frequency, argv[1]);
+
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+
+    // Abort RTTTL if playing on this pin.
+    RTTTLState *rt = qjs->rtttlFind((uint8_t)pin);
+    if (rt) rt->gen++;
+
+    JSValue wargv[4] = {
+      JS_NewUint32(ctx, pin),
+      JS_NewUint32(ctx, 511),         // 50% duty (10-bit)
+      JS_NewUint32(ctx, frequency),
+      JS_NewUint32(ctx, 10),
+    };
+    JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
+    return ret;
+  }
+
   // analogWrite(pin, fraction, [freq=5000])
   // Arduino-style API. fraction is 0.0..1.0.
   //   - fraction == 0.0  -> digitalWrite(pin, LOW); if the pin was
@@ -5136,6 +5257,10 @@ class ESP32QuickJS {
 
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     if (!qjs) return JS_ThrowInternalError(ctx, "analogWrite: no context opaque");
+
+    // Abort RTTTL if playing on this pin.
+    RTTTLState *rt = qjs->rtttlFind((uint8_t)pin);
+    if (rt) rt->gen++;
 
     if (frac <= 0.0 || frac >= 1.0) {
       // Edge case: 0% or 100% — use digitalWrite, detach PWM.
@@ -5168,6 +5293,267 @@ class ESP32QuickJS {
     return ret;
   }
 
+  // esp32.playRTTTL(pin, rtttlString, [onComplete]) → void
+  // Parses an RTTTL string into a note list and starts non-blocking
+  // playback. Each note is driven via analog.js_writeAnalog (50% duty,
+  // 10-bit). Playback advances from loop() based on millis() timing.
+  // If any write function is called on the same pin, playback aborts.
+  // onComplete is called (no args) when the song finishes naturally.
+  static JSValue esp32_play_rtttl(JSContext *ctx, JSValueConst jsThis,
+                                  int argc, JSValueConst *argv) {
+    if (argc < 2) {
+      return JS_ThrowTypeError(ctx, "playRTTTL: need (pin, rtttlString, [onComplete])");
+    }
+    uint32_t pin;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    const char *str = JS_ToCString(ctx, argv[1]);
+    if (!str) return JS_ThrowTypeError(ctx, "playRTTTL: rtttlString must be a string");
+
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+
+    // Abort any existing playback on THIS pin (not other pins).
+    RTTTLState *existing = qjs->rtttlFind((uint8_t)pin);
+    if (existing) {
+      existing->gen++;
+      existing->active = false;
+      if (!JS_IsUndefined(existing->onComplete)) {
+        JS_FreeValue(ctx, existing->onComplete);
+        existing->onComplete = JS_UNDEFINED;
+      }
+      existing->notes.clear();
+    }
+
+    // --- Parse RTTTL ---
+    // Format: name:d=duration,o=octave,b=tempo:note,note,...
+    // Defaults: d=4 (quarter), o=5 (octave 5), b=63 (tempo)
+    uint32_t defaultDuration = 4;  // quarter note
+    uint32_t defaultOctave = 5;
+    uint32_t tempo = 63;
+
+    std::string s(str);
+    JS_FreeCString(ctx, str);
+
+    // Split into name:settings:notes
+    // Find first ':' (end of name)
+    size_t pos1 = s.find(':');
+    if (pos1 == std::string::npos) {
+      return JS_ThrowTypeError(ctx, "playRTTTL: invalid format (no name delimiter)");
+    }
+    // Find second ':' (end of settings)
+    size_t pos2 = s.find(':', pos1 + 1);
+    if (pos2 == std::string::npos) {
+      return JS_ThrowTypeError(ctx, "playRTTTL: invalid format (no settings delimiter)");
+    }
+
+    // Parse settings (d=, o=, b=)
+    std::string settings = s.substr(pos1 + 1, pos2 - pos1 - 1);
+    {
+      // Split by commas
+      size_t start = 0;
+      while (start < settings.size()) {
+        size_t comma = settings.find(',', start);
+        std::string token = (comma == std::string::npos)
+          ? settings.substr(start)
+          : settings.substr(start, comma - start);
+        // token is like "d=4", "o=5", "b=63"
+        size_t eq = token.find('=');
+        if (eq != std::string::npos) {
+          std::string key = token.substr(0, eq);
+          std::string val = token.substr(eq + 1);
+          if (key == "d") defaultDuration = atoi(val.c_str());
+          else if (key == "o") defaultOctave = atoi(val.c_str());
+          else if (key == "b") tempo = atoi(val.c_str());
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
+
+    // Whole note duration in ms = (60 / tempo) * 4 * 1000
+    // Each note duration = wholeNote / noteDurationValue
+    uint32_t wholeNoteMs = (60000 / tempo) * 4;
+
+    // Parse notes (comma-separated, after second ':')
+    std::string notesStr = s.substr(pos2 + 1);
+    std::vector<std::pair<uint32_t, uint32_t>> notes;
+
+    // Note frequency table (octave 4 = base, MIDI-style).
+    // Frequencies for octave 4: C=262, C#=277, D=294, D#=311, E=330,
+    // F=349, F#=370, G=392, G#=415, A=440, A#=466, B=494
+    static const uint32_t noteFreqs[12] = {
+      262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494
+    };
+    // Map note letter to index 0-11 (C=0, D=2, E=4, F=5, G=7, A=9, B=11)
+    auto noteIndex = [](char c) -> int {
+      switch (c) {
+        case 'c': return 0;
+        case 'd': return 2;
+        case 'e': return 4;
+        case 'f': return 5;
+        case 'g': return 7;
+        case 'a': return 9;
+        case 'b': return 11;
+        default:  return -1;
+      }
+    };
+
+    size_t start = 0;
+    while (start < notesStr.size()) {
+      size_t comma = notesStr.find(',', start);
+      std::string token = (comma == std::string::npos)
+        ? notesStr.substr(start)
+        : notesStr.substr(start, comma - start);
+      // Trim whitespace
+      while (!token.empty() && isspace(token[0])) token.erase(0, 1);
+      while (!token.empty() && isspace(token.back())) token.pop_back();
+      if (token.empty()) {
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+        continue;
+      }
+
+      // Parse: [duration][note][#|.][octave]
+      // duration: optional number (1, 2, 4, 8, 16, 32)
+      // note: a-g or p (pause/rest)
+      // #: sharp (optional)
+      // .: dotted (optional, multiplies duration by 1.5)
+      // octave: optional number (4-7)
+      size_t i = 0;
+
+      // Duration
+      uint32_t duration = defaultDuration;
+      if (i < token.size() && isdigit(token[i])) {
+        uint32_t d = 0;
+        while (i < token.size() && isdigit(token[i])) {
+          d = d * 10 + (token[i] - '0');
+          i++;
+        }
+        if (d > 0) duration = d;
+      }
+
+      // Note letter
+      if (i >= token.size()) {
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+        continue;
+      }
+      char note = tolower(token[i]);
+      i++;
+
+      uint32_t freq = 0;  // 0 = rest
+      if (note == 'p') {
+        // Rest
+        freq = 0;
+      } else {
+        int idx = noteIndex(note);
+        if (idx < 0) {
+          // Invalid note — skip
+          if (comma == std::string::npos) break;
+          start = comma + 1;
+          continue;
+        }
+        // Sharp?
+        if (i < token.size() && token[i] == '#') {
+          idx++;
+          i++;
+        }
+        // Dotted? (we'll handle after octave)
+        bool dotted = false;
+        if (i < token.size() && token[i] == '.') {
+          dotted = true;
+          i++;
+        }
+        // Octave
+        uint32_t octave = defaultOctave;
+        if (i < token.size() && isdigit(token[i])) {
+          octave = token[i] - '0';
+          i++;
+        }
+        // Calculate frequency: base freq * 2^(octave - 4)
+        if (idx >= 0 && idx < 12) {
+          freq = noteFreqs[idx];
+          if (octave >= 4) {
+            for (uint32_t o = 4; o < octave; o++) freq *= 2;
+          } else {
+            for (uint32_t o = octave; o < 4; o++) freq /= 2;
+          }
+        }
+        // Duration with dotted note
+        uint32_t durMs = wholeNoteMs / duration;
+        if (dotted) durMs = durMs * 3 / 2;
+        notes.push_back({freq, durMs});
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+        continue;
+      }
+
+      // Rest duration
+      bool dotted = false;
+      if (i < token.size() && token[i] == '.') {
+        dotted = true;
+        i++;
+      }
+      uint32_t durMs = wholeNoteMs / duration;
+      if (dotted) durMs = durMs * 3 / 2;
+      notes.push_back({0, durMs});
+
+      if (comma == std::string::npos) break;
+      start = comma + 1;
+    }
+
+    if (notes.empty()) {
+      return JS_ThrowTypeError(ctx, "playRTTTL: no valid notes parsed");
+    }
+
+    // Find or create a player slot for this pin.
+    RTTTLState *player = nullptr;
+    for (auto &p : qjs->rtttlPlayers) {
+      if (!p.active && p.pin == pin) { player = &p; break; }
+    }
+    if (!player) {
+      for (auto &p : qjs->rtttlPlayers) {
+        if (!p.active) { player = &p; break; }
+      }
+    }
+    if (!player) {
+      qjs->rtttlPlayers.emplace_back();
+      player = &qjs->rtttlPlayers.back();
+    }
+
+    // Set up RTTTL state.
+    player->pin = (uint8_t)pin;
+    player->notes = std::move(notes);
+    player->noteIdx = 0;
+    player->noteStartMs = millis();
+    player->gen++;
+    player->startGen = player->gen;
+    player->active = true;
+    if (argc >= 3 && JS_IsFunction(ctx, argv[2])) {
+      player->onComplete = JS_DupValue(ctx, argv[2]);
+    } else {
+      player->onComplete = JS_UNDEFINED;
+    }
+
+    // Start the first note immediately.
+    uint32_t freq = player->notes[0].first;
+    if (freq == 0) {
+      // Rest — turn off PWM.
+      qjs->analog.detachPwmIfAttached((uint8_t)pin);
+    } else {
+      JSValue wargv[4] = {
+        JS_NewUint32(ctx, pin),
+        JS_NewUint32(ctx, 511),
+        JS_NewUint32(ctx, freq),
+        JS_NewUint32(ctx, 10),
+      };
+      JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
+      for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
+      JS_FreeValue(ctx, ret);
+    }
+
+    return JS_UNDEFINED;
+  }
+
   static JSValue esp32_deep_sleep(JSContext *ctx, JSValueConst jsThis, int argc,
                                   JSValueConst *argv) {
     uint32_t t;
@@ -5181,67 +5567,6 @@ class ESP32QuickJS {
     ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
     qjs->setLoopFunc(JS_DupValue(ctx, argv[0]));
     return JS_UNDEFINED;
-  }
-
-  // esp32.tone(pin, frequency, [durationMs]) → Promise<void>
-  // Plays a square-wave tone on `pin` using the LEDC peripheral.
-  // 50% duty cycle at the requested frequency. If `durationMs` is
-  // provided, the tone auto-stops after that many milliseconds (via
-  // setTimeout); otherwise it plays until esp32.noTone(pin) is called.
-  // Uses the same LEDC channel pool as writeAnalog/analogWrite.
-  static JSValue esp32_tone(JSContext *ctx, JSValueConst jsThis, int argc,
-                            JSValueConst *argv) {
-    if (argc < 2) {
-      return JS_ThrowTypeError(ctx, "tone: need (pin, frequency, [durationMs])");
-    }
-    uint32_t pin, frequency;
-    JS_ToUint32(ctx, &pin, argv[0]);
-    JS_ToUint32(ctx, &frequency, argv[1]);
-    uint32_t durationMs = 0;
-    if (argc >= 3) JS_ToUint32(ctx, &durationMs, argv[2]);
-
-    // Forward to writeAnalog with 50% duty at 10-bit resolution.
-    // 50% of 1023 = 511. This gives a clean square wave.
-    JSValue wargv[4] = {
-      JS_NewUint32(ctx, pin),
-      JS_NewUint32(ctx, 511),         // 50% duty (10-bit)
-      JS_NewUint32(ctx, frequency),   // frequency in Hz
-      JS_NewUint32(ctx, 10),          // 10-bit resolution
-    };
-    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
-    JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
-    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
-
-    // If a duration was given, schedule auto-stop via setTimeout.
-    if (durationMs > 0 && !JS_IsException(ret)) {
-      // Build: setTimeout(() => esp32.noTone(pin), durationMs)
-      // We call writeAnalogStop directly via the analog member.
-      // Use a simple approach: queue a setTimeout that calls noTone.
-      // Since we can't easily create a JS closure capturing pin,
-      // we use a C-side timer. The simplest: use the JS timer system
-      // by eval'ing a small script.
-      char script[128];
-      snprintf(script, sizeof(script),
-        "setTimeout(function(){ esp32.noTone(%u); }, %u)",
-        (unsigned)pin, (unsigned)durationMs);
-      JSValue ev = JS_Eval(ctx, script, strlen(script),
-                           "<tone-auto-stop>", JS_EVAL_TYPE_GLOBAL);
-      JS_FreeValue(ctx, ev);
-    }
-    return ret;
-  }
-
-  // esp32.noTone(pin) → Promise<void>
-  // Stops a tone on `pin`. Equivalent to writeAnalogStop(pin).
-  static JSValue esp32_no_tone(JSContext *ctx, JSValueConst jsThis, int argc,
-                               JSValueConst *argv) {
-    if (argc < 1) {
-      return JS_ThrowTypeError(ctx, "noTone: need (pin)");
-    }
-    uint32_t pin;
-    JS_ToUint32(ctx, &pin, argv[0]);
-    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
-    return qjs->analog.js_writeAnalogStop(ctx, argc, argv);
   }
 
   static JSValue wifi_is_connected(JSContext *ctx, JSValueConst jsThis,
