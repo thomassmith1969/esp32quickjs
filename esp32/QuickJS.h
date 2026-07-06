@@ -4611,6 +4611,9 @@ class ESP32QuickJS {
         JSCFunctionListEntry{"analogWrite", 0, JS_DEF_CFUNC, 0, {
                                func : {3, JS_CFUNC_generic, esp32_analog_write}
                              }},
+        JSCFunctionListEntry{"servoWrite", 0, JS_DEF_CFUNC, 0, {
+                               func : {2, JS_CFUNC_generic, esp32_servo_write}
+                             }},
         JSCFunctionListEntry{"deepSleep", 0, JS_DEF_CFUNC, 0, {
                                func : {1, JS_CFUNC_generic, esp32_deep_sleep}
                              }},
@@ -4703,28 +4706,29 @@ class ESP32QuickJS {
       JS_SetPropertyFunctionList(ctx, spiObj, spi_funcs,
                                  sizeof(spi_funcs) / sizeof(JSCFunctionListEntry));
     }
-    // servo = { attach, detach, write, writeUs }
-    // All four return Promises; the actual MCPWM setup runs in loop().
-    {
-      JSValue servoObj = JS_NewObject(ctx);
-      JS_SetPropertyStr(ctx, global, "servo", servoObj);
-      static const JSCFunctionListEntry servo_funcs[] = {
-          JSCFunctionListEntry{"attach", 0, JS_DEF_CFUNC, 0, {
-              func : {2, JS_CFUNC_generic, JSServo::js_attach}
-          }},
-          JSCFunctionListEntry{"detach", 0, JS_DEF_CFUNC, 0, {
-              func : {1, JS_CFUNC_generic, JSServo::js_detach}
-          }},
-          JSCFunctionListEntry{"write", 0, JS_DEF_CFUNC, 0, {
-              func : {2, JS_CFUNC_generic, JSServo::js_write}
-          }},
-          JSCFunctionListEntry{"writeUs", 0, JS_DEF_CFUNC, 0, {
-              func : {2, JS_CFUNC_generic, JSServo::js_writeUs}
-          }},
-      };
-      JS_SetPropertyFunctionList(ctx, servoObj, servo_funcs,
-                                 sizeof(servo_funcs) / sizeof(JSCFunctionListEntry));
-    }
+    // servo implementation was completely wrong... removing
+    // // servo = { attach, detach, write, writeUs }
+    // // All four return Promises; the actual MCPWM setup runs in loop().
+    // {
+    //   JSValue servoObj = JS_NewObject(ctx);
+    //   JS_SetPropertyStr(ctx, global, "servo", servoObj);
+    //   static const JSCFunctionListEntry servo_funcs[] = {
+    //       JSCFunctionListEntry{"attach", 0, JS_DEF_CFUNC, 0, {
+    //           func : {2, JS_CFUNC_generic, JSServo::js_attach}
+    //       }},
+    //       JSCFunctionListEntry{"detach", 0, JS_DEF_CFUNC, 0, {
+    //           func : {1, JS_CFUNC_generic, JSServo::js_detach}
+    //       }},
+    //       JSCFunctionListEntry{"write", 0, JS_DEF_CFUNC, 0, {
+    //           func : {2, JS_CFUNC_generic, JSServo::js_write}
+    //       }},
+    //       JSCFunctionListEntry{"writeUs", 0, JS_DEF_CFUNC, 0, {
+    //           func : {2, JS_CFUNC_generic, JSServo::js_writeUs}
+    //       }},
+    //   };
+    //   JS_SetPropertyFunctionList(ctx, servoObj, servo_funcs,
+    //                              sizeof(servo_funcs) / sizeof(JSCFunctionListEntry));
+    //}
 
     {
       // Register the RotaryEncoder class. Pattern follows the Worker
@@ -5076,6 +5080,37 @@ class ESP32QuickJS {
     return qjs->analog.js_readAnalog(ctx, argc, argv);
   }
 
+  static JSValue esp32_servo_write(JSContext *ctx, JSValueConst jsThis, int argc,
+                                   JSValueConst *argv) {
+    // servoWrite(pin, degrees)
+    // Maps 0-180° to 544-2400µs pulse at 50Hz, 14-bit, using the LEDC
+    // pool via analog.js_writeAnalog.
+    if (argc < 2) {
+      return JS_ThrowTypeError(ctx, "servoWrite: need (pin, degrees)");
+    }
+    uint32_t pin, degrees;
+    JS_ToUint32(ctx, &pin, argv[0]);
+    JS_ToUint32(ctx, &degrees, argv[1]);
+    if (degrees > 180) degrees = 180;
+
+    // Standard servo pulse range (544-2400µs matches Arduino Servo.h).
+    // Pulse width in µs: 544 + (degrees / 180) * (2400 - 544)
+    // Duty for 14-bit @ 50Hz (20ms period): pulseUs * 16384 / 20000
+    uint32_t pulseUs = 544 + (degrees * 1856) / 180;
+    uint32_t duty = (pulseUs * 16384) / 20000;
+
+    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
+
+    JSValue wargv[4] = {
+      JS_DupValue(ctx, argv[0]),
+      JS_NewUint32(ctx, duty),
+      JS_NewUint32(ctx, 50),
+      JS_NewUint32(ctx, 14),
+    };
+    JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
+    return ret;
+  }
   // analogWrite(pin, fraction, [freq=5000])
   // Arduino-style API. fraction is 0.0..1.0.
   //   - fraction == 0.0  -> digitalWrite(pin, LOW); if the pin was
