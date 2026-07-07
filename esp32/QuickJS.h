@@ -23,6 +23,9 @@ class ESP32QuickJS;
 #include "MotorDriver.h"
 #include "JSMotorDriver.h"
 
+#include "Neopixel.h"
+#include "JSNeopixel.h"
+
 #include "JSStash.h"
 
 #include <algorithm>
@@ -224,31 +227,48 @@ class JSWorker {
 };
 inline JSWorker* JSWorker::instance = nullptr;
 
-// Non-blocking HTTP fetcher. All blocking I/O (HTTPClient::sendRequest/GET,
-// reading the response body) happens on a FreeRTOS task so the JS main loop
-// never stalls. The main loop just polls a "done" flag and resolves the
-// JS Promise when the background task has the full response.
+// Non-blocking HTTP fetcher with streaming body.
+//
+// The background task does the connect + sendRequest + read status,
+// then keeps the connection alive. The JS promise resolves with a
+// stream object (body) that JS reads incrementally. No body data is
+// buffered in C++ RAM — it goes straight from the TCP socket to JS.
+//
+// JS API:
+//   let resp = await fetch("https://example.com")
+//   let s = resp.body
+//   while (s.connected()) {
+//     let avail = s.available()
+//     if (avail > 0) console.log(s.read(avail))
+//   }
+//   s.close()
 class JSHttpFetcher {
  public:
   struct Entry {
     JSContext *ctx;
     JSValue resolving_funcs[2];
-    // Input (set by JS thread before queuing):
     std::string url;
     std::string method;
     std::string body;
-    // Output (written by task under mutex, read by JS thread):
+
+    // Header phase (set by background task):
     volatile bool done;
-    volatile bool ok;       // true = success, false = error
+    volatile bool ok;
     int status;
-    std::string responseHeaders;
-    std::string responseBody;
     std::string errorMsg;
+
+    // Streaming phase (valid after done && ok):
+    HTTPClient *http;          // heap-allocated, owned by Entry
+    WiFiClient *stream;        // = http->getStreamPtr()
+    volatile bool streamActive;
+    int streamId;
   };
 
  private:
-  std::vector<Entry *> queue;          // all pending entries (JS thread)
-  std::vector<Entry *> workQueue_;     // entries waiting for the task
+  std::vector<Entry *> queue;          // pending (pre-headers)
+  std::vector<Entry *> workQueue_;     // waiting for the task
+  std::vector<Entry *> liveStreams;    // active streams (post-headers)
+  int nextStreamId_ = 0;
   TaskHandle_t task_ = nullptr;
   SemaphoreHandle_t mutex_ = nullptr;
   SemaphoreHandle_t notify_ = nullptr;
@@ -272,48 +292,159 @@ class JSHttpFetcher {
   }
 
   void doFetch(Entry *e) {
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(10000);
-    if (!http.begin(e->url.c_str())) {
+    // Heap-allocate the HTTPClient so it survives after doFetch returns.
+    HTTPClient *http = new HTTPClient();
+    http->setConnectTimeout(10000);
+    http->setTimeout(10000);
+    if (!http->begin(e->url.c_str())) {
       xSemaphoreTake(mutex_, portMAX_DELAY);
       e->ok = false;
       e->errorMsg = "begin() failed";
       e->done = true;
+      e->http = nullptr;
+      e->stream = nullptr;
+      e->streamActive = false;
       xSemaphoreGive(mutex_);
+      delete http;
       return;
     }
     int code;
     if (!e->method.empty() && e->method != "GET") {
-      code = http.sendRequest(e->method.c_str(),
-                             (uint8_t *)e->body.c_str(),
-                             e->body.length());
+      code = http->sendRequest(e->method.c_str(),
+                               (uint8_t *)e->body.c_str(),
+                               e->body.length());
     } else {
-      code = http.GET();
+      code = http->GET();
     }
     if (code <= 0) {
       xSemaphoreTake(mutex_, portMAX_DELAY);
       e->ok = false;
       e->errorMsg = "HTTP error: " + std::to_string(code);
       e->done = true;
+      e->http = nullptr;
+      e->stream = nullptr;
+      e->streamActive = false;
       xSemaphoreGive(mutex_);
-      http.end();
+      delete http;
       return;
     }
-    String bodyStr = http.getString();
-    xSemaphoreTake(mutex_, portMAX_DELAY);
+    // Success — keep connection alive for streaming reads.
+    // Store the heap-allocated http so the stream object can access it.
+    e->http = http;
+    e->stream = http->getStreamPtr();
+    e->streamActive = true;
     e->ok = true;
     e->status = code;
-    e->responseBody = std::string(bodyStr.c_str());
     e->done = true;
-    xSemaphoreGive(mutex_);
-    http.end();
+  }
+
+  // ---- Stream JS methods ----
+  static JSHttpFetcher *instance;
+
+  static JSValue stream_read(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    JSValue idVal = JS_GetPropertyStr(ctx, this_val, "_streamId");
+    uint32_t id;
+    JS_ToUint32(ctx, &id, idVal);
+    JS_FreeValue(ctx, idVal);
+    if (!instance) return JS_ThrowInternalError(ctx, "no fetcher instance");
+    Entry *e = (id < instance->liveStreams.size())
+                 ? instance->liveStreams[id] : nullptr;
+    if (!e || !e->stream || !e->streamActive)
+      return JS_ThrowReferenceError(ctx, "stream closed");
+    uint32_t maxLen = 1024;
+    if (argc >= 1) JS_ToUint32(ctx, &maxLen, argv[0]);
+    if (maxLen > 4096) maxLen = 4096;
+    uint8_t *buf = (uint8_t *)js_malloc(ctx, maxLen);
+    if (!buf) return JS_EXCEPTION;
+    int actual = e->stream->read(buf, maxLen);
+    if (actual <= 0) {
+      js_free(ctx, buf);
+      return JS_NewString(ctx, "");
+    }
+    JSValue ret = JS_NewStringLen(ctx, (const char *)buf, actual);
+    js_free(ctx, buf);
+    return ret;
+  }
+
+  static JSValue stream_available(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    JSValue idVal = JS_GetPropertyStr(ctx, this_val, "_streamId");
+    uint32_t id;
+    JS_ToUint32(ctx, &id, idVal);
+    JS_FreeValue(ctx, idVal);
+    if (!instance) return JS_NewInt32(ctx, -1);
+    Entry *e = (id < instance->liveStreams.size())
+                 ? instance->liveStreams[id] : nullptr;
+    if (!e || !e->stream || !e->streamActive)
+      return JS_NewInt32(ctx, -1);
+    return JS_NewInt32(ctx, e->stream->available());
+  }
+
+  static JSValue stream_connected(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    JSValue idVal = JS_GetPropertyStr(ctx, this_val, "_streamId");
+    uint32_t id;
+    JS_ToUint32(ctx, &id, idVal);
+    JS_FreeValue(ctx, idVal);
+    if (!instance) return JS_NewBool(ctx, false);
+    Entry *e = (id < instance->liveStreams.size())
+                 ? instance->liveStreams[id] : nullptr;
+    if (!e || !e->stream || !e->streamActive)
+      return JS_NewBool(ctx, false);
+    return JS_NewBool(ctx, e->stream->connected());
+  }
+
+  static JSValue stream_close(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    JSValue idVal = JS_GetPropertyStr(ctx, this_val, "_streamId");
+    uint32_t id;
+    JS_ToUint32(ctx, &id, idVal);
+    JS_FreeValue(ctx, idVal);
+    if (instance) instance->closeStream(id);
+    return JS_UNDEFINED;
+  }
+
+  void closeStream(uint32_t id) {
+    if (id >= liveStreams.size()) return;
+    Entry *e = liveStreams[id];
+    if (!e) return;
+    if (e->http) {
+      e->streamActive = false;
+      e->http->end();
+      delete e->http;
+      e->http = nullptr;
+      e->stream = nullptr;
+    }
+    if (e->resolving_funcs[0] != JS_UNDEFINED) {
+      JS_FreeValue(e->ctx, e->resolving_funcs[0]);
+      JS_FreeValue(e->ctx, e->resolving_funcs[1]);
+      e->resolving_funcs[0] = JS_UNDEFINED;
+      e->resolving_funcs[1] = JS_UNDEFINED;
+    }
+    delete e;
+    liveStreams[id] = nullptr;
+  }
+
+  JSValue createStreamObject(JSContext *ctx, Entry *e) {
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "_streamId", JS_NewInt32(ctx, e->streamId));
+    JS_SetPropertyStr(ctx, obj, "read",
+      JS_NewCFunction(ctx, stream_read, "read", 1));
+    JS_SetPropertyStr(ctx, obj, "available",
+      JS_NewCFunction(ctx, stream_available, "available", 0));
+    JS_SetPropertyStr(ctx, obj, "connected",
+      JS_NewCFunction(ctx, stream_connected, "connected", 0));
+    JS_SetPropertyStr(ctx, obj, "close",
+      JS_NewCFunction(ctx, stream_close, "close", 0));
+    return obj;
   }
 
  public:
   JSHttpFetcher() {}
 
   void init() {
+    instance = this;
     if (task_) return;
     mutex_ = xSemaphoreCreateMutex();
     notify_ = xSemaphoreCreateBinary();
@@ -333,6 +464,17 @@ class JSHttpFetcher {
       delete e;
     }
     queue.clear();
+    for (auto *e : liveStreams) {
+      if (e) {
+        if (e->http) { e->http->end(); delete e->http; }
+        if (e->resolving_funcs[0] != JS_UNDEFINED) {
+          JS_FreeValue(e->ctx, e->resolving_funcs[0]);
+          JS_FreeValue(e->ctx, e->resolving_funcs[1]);
+        }
+        delete e;
+      }
+    }
+    liveStreams.clear();
   }
 
   JSValue fetch(JSContext *ctx, JSValueConst jsUrl, JSValueConst options) {
@@ -367,6 +509,10 @@ class JSHttpFetcher {
     e->done = false;
     e->ok = false;
     e->status = 0;
+    e->http = nullptr;
+    e->stream = nullptr;
+    e->streamActive = false;
+    e->streamId = -1;
     e->resolving_funcs[0] = JS_UNDEFINED;
     e->resolving_funcs[1] = JS_UNDEFINED;
     JS_FreeCString(ctx, url);
@@ -401,30 +547,39 @@ class JSHttpFetcher {
     xSemaphoreGive(mutex_);
 
     for (auto e : doneEntries) {
-      bool ok = e->ok;
-      int status = e->status;
-      std::string body = e->responseBody;
-      std::string err = e->errorMsg;
       JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
+      // Clear immediately so we don't double-free.
+      e->resolving_funcs[0] = JS_UNDEFINED;
+      e->resolving_funcs[1] = JS_UNDEFINED;
       JSContext *ectx = e->ctx;
 
-      if (ok) {
-        JSValue r = JS_NewObject(ectx);
-        JS_SetPropertyStr(ectx, r, "status", JS_NewInt32(ectx, status));
-        JS_SetPropertyStr(ectx, r, "body", JS_NewString(ectx, body.c_str()));
-        JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &r);
-        JS_FreeValue(ectx, r);
+      if (e->ok && e->http) {
+        // Streaming success — resolve with { status, body }
+        e->streamId = nextStreamId_++;
+        if ((size_t)e->streamId >= liveStreams.size()) {
+          liveStreams.resize(e->streamId + 1, nullptr);
+        }
+        liveStreams[e->streamId] = e;
+
+        JSValue resp = JS_NewObject(ectx);
+        JS_SetPropertyStr(ectx, resp, "status", JS_NewInt32(ectx, e->status));
+        JS_SetPropertyStr(ectx, resp, "body", createStreamObject(ectx, e));
+        JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &resp);
+        JS_FreeValue(ectx, resp);
       } else {
-        JSValue errv = JS_NewString(ectx, err.c_str());
+        // Error — reject and clean up immediately (no stream).
+        JSValue errv = JS_NewString(ectx, e->errorMsg.c_str());
         JS_Call(ectx, rfs[1], JS_UNDEFINED, 1, &errv);
         JS_FreeValue(ectx, errv);
+        delete e;
       }
       JS_FreeValue(ectx, rfs[0]);
       JS_FreeValue(ectx, rfs[1]);
-      delete e;
     }
   }
 };
+
+inline JSHttpFetcher* JSHttpFetcher::instance = nullptr;
 
 class JSConnection {
 public:
@@ -930,6 +1085,25 @@ class JSAnalog {
   // returning junk. 
   bool isPinBusy(uint8_t pin) const {
     return getPinChannel(pin) != PIN_UNUSED;
+  }
+
+  // Apply an LEDC PWM write synchronously — no Promise, no queuing.
+  // Used by esp32_servo_write for interval-safe operation.
+  void applyServoPwm(uint8_t pin, uint32_t duty, uint32_t frequency,
+                     uint8_t resolution) {
+    int ch = getPinChannel(pin);
+    if (ch == PIN_UNUSED || ch == PIN_INVALID) {
+      ch = allocChannel();
+      if (ch >= 0) {
+        ledcSetup(ch, frequency, resolution);
+        ledcAttachPin(pin, ch);
+        setPinChannel(pin, (uint8_t)ch);
+      }
+    }
+    // Already set up — just write the new duty. No alloc/free = no heap frag.
+    if (ch >= 0) {
+      ledcWrite(ch, duty);
+    }
   }
 
   // Public helper for the analogWrite 0%/100% edge case. If the pin
@@ -2739,6 +2913,7 @@ class ESP32QuickJS {
   JSSPI spi;
   JSEspNow espNow;
   JSMotorDriver motorDriver;
+  JSNeopixel neopixel;
 
   // ---- Serial/UART ----
   // ESP32 has 3 UARTs. UART0 is used for Serial (USB). We expose
@@ -2876,6 +3051,7 @@ class ESP32QuickJS {
     sd.init();
     motorDriver.analog = &analog;  // share LEDC allocator with analogWrite
     motorDriver.init();
+    neopixel.init();
     // Wire the static trampoline so C callbacks can find this instance.
     JSEspNow::instance = &espNow;
     espNow.ctx = ctx;
@@ -2943,6 +3119,7 @@ class ESP32QuickJS {
     spi.loop(ctx);
     espNow.loop();
     motorDriver.loop(ctx);
+    neopixel.loop(ctx);
 
     // Serial/UART data polling — fire onData callbacks when data arrives.
     // Non-blocking: available() returns 0 if nothing to read.
@@ -4447,6 +4624,42 @@ class ESP32QuickJS {
       JS_SetPropertyStr(ctx, global, "MotorDriver", ctor);
     }
 
+    {
+      // Register the Neopixel class.
+      JSRuntime *rt = JS_GetRuntime(ctx);
+      JS_NewClassID(&JSNeopixel::js_class_id);
+      JS_NewClass(rt, JSNeopixel::js_class_id,
+                  &JSNeopixel::js_class_def);
+
+      JSValue proto = JS_NewObject(ctx);
+      JS_SetPropertyStr(
+          ctx, proto, "setPixelColor",
+          JS_NewCFunction(ctx, JSNeopixel::js_setPixelColor, "setPixelColor", 4));
+      JS_SetPropertyStr(
+          ctx, proto, "getPixelColor",
+          JS_NewCFunction(ctx, JSNeopixel::js_getPixelColor, "getPixelColor", 1));
+      JS_SetPropertyStr(
+          ctx, proto, "fill",
+          JS_NewCFunction(ctx, JSNeopixel::js_fill, "fill", 3));
+      JS_SetPropertyStr(
+          ctx, proto, "clear",
+          JS_NewCFunction(ctx, JSNeopixel::js_clear, "clear", 0));
+      JS_SetPropertyStr(
+          ctx, proto, "numPixels",
+          JS_NewCFunction(ctx, JSNeopixel::js_numPixels, "numPixels", 0));
+      JS_SetPropertyStr(
+          ctx, proto, "show",
+          JS_NewCFunction(ctx, JSNeopixel::js_show, "show", 0));
+
+      JSValue ctor = JS_NewCFunction2(ctx, JSNeopixel::js_ctor,
+                                      "Neopixel", 2,
+                                      JS_CFUNC_constructor, 0);
+      JS_SetConstructor(ctx, ctor, proto);
+      JS_SetClassProto(ctx, JSNeopixel::js_class_id, proto);
+
+      JS_SetPropertyStr(ctx, global, "Neopixel", ctor);
+    }
+
 #ifndef GLOBAL_ESP32
     JSModuleDef *m =
         JS_NewCModule(ctx, "esp32", [](JSContext *ctx, JSModuleDef *m) {
@@ -4736,8 +4949,9 @@ class ESP32QuickJS {
   static JSValue esp32_servo_write(JSContext *ctx, JSValueConst jsThis, int argc,
                                    JSValueConst *argv) {
     // servoWrite(pin, degrees)
-    // Maps 0-180° to 544-2400µs pulse at 50Hz, 14-bit, using the LEDC
-    // pool via analog.js_writeAnalog.
+    // Maps 0-180° to 544-2400µs pulse at 50Hz, 14-bit.
+    // Applies the PWM directly — no Promise needed since callers
+    // (setInterval, etc.) discard the return value anyway.
     if (argc < 2) {
       return JS_ThrowTypeError(ctx, "servoWrite: need (pin, degrees)");
     }
@@ -4758,15 +4972,9 @@ class ESP32QuickJS {
     RTTTLState *rt = qjs->rtttlFind((uint8_t)pin);
     if (rt) rt->gen++;
 
-    JSValue wargv[4] = {
-      JS_DupValue(ctx, argv[0]),
-      JS_NewUint32(ctx, duty),
-      JS_NewUint32(ctx, 50),
-      JS_NewUint32(ctx, 14),
-    };
-    JSValue ret = qjs->analog.js_writeAnalog(ctx, 4, (JSValueConst*)wargv);
-    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, wargv[i]);
-    return ret;
+    // Apply PWM directly — synchronous, non-blocking, no Promise.
+    qjs->analog.applyServoPwm((uint8_t)pin, duty, 50, 14);
+    return JS_UNDEFINED;
   }
 
   // esp32.tone(pin, frequency) → Promise<void>
