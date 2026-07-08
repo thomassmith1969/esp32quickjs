@@ -61,6 +61,7 @@ extern int currentTelnetId;
 #include <freertos/semphr.h>
 
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Server.h>
 #include <StreamString.h>
 
@@ -262,9 +263,18 @@ class JSHttpFetcher {
     WiFiClient *stream;        // = http->getStreamPtr()
     volatile bool streamActive;
     int streamId;
+
+    // SSL pool slot (-1 = not using pool)
+    int sslIdx;
+    // Auto-close deadline in millis (0 = no timeout)
+    uint32_t closeDeadlineMs;
   };
 
  private:
+  static const int SSL_POOL_SIZE = 4;
+  WiFiClientSecure *sslPool_[SSL_POOL_SIZE];
+  bool sslInUse_[SSL_POOL_SIZE];
+
   std::vector<Entry *> queue;          // pending (pre-headers)
   std::vector<Entry *> workQueue_;     // waiting for the task
   std::vector<Entry *> liveStreams;    // active streams (post-headers)
@@ -273,6 +283,24 @@ class JSHttpFetcher {
   SemaphoreHandle_t mutex_ = nullptr;
   SemaphoreHandle_t notify_ = nullptr;
   volatile bool stopping_ = false;
+
+  // Acquire an SSL pool slot. Returns index (0..SSL_POOL_SIZE-1) or -1 if full.
+  // Caller MUST hold mutex_.
+  int acquireSsl() {
+    for (int i = 0; i < SSL_POOL_SIZE; i++) {
+      if (!sslInUse_[i]) {
+        sslInUse_[i] = true;
+        return i;
+      }
+    }
+    return -1;  // pool exhausted
+  }
+
+  // Release an SSL pool slot. Caller MUST hold mutex_.
+  void releaseSsl(int idx) {
+    if (idx < 0 || idx >= SSL_POOL_SIZE) return;
+    sslInUse_[idx] = false;
+  }
 
   static void taskEntry(void *arg) {
     static_cast<JSHttpFetcher *>(arg)->fetchTask();
@@ -292,11 +320,40 @@ class JSHttpFetcher {
   }
 
   void doFetch(Entry *e) {
+    // Acquire an SSL pool slot (must hold mutex_).
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    int sslIdx = acquireSsl();
+    xSemaphoreGive(mutex_);
+    if (sslIdx < 0) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      e->ok = false;
+      e->errorMsg = "SSL pool exhausted";
+      e->done = true;
+      e->http = nullptr;
+      e->stream = nullptr;
+      e->streamActive = false;
+      e->sslIdx = -1;
+      xSemaphoreGive(mutex_);
+      return;
+    }
+    e->sslIdx = sslIdx;
+
+    // If this slot was used before, close the old connection now.
+    // This frees the mbedTLS context. The re-allocation happens
+    // immediately below in http->begin(), back-to-back on the
+    // background task with zero fragmentation window.
+    if (sslPool_[sslIdx]) {
+      sslPool_[sslIdx]->stop();
+    } else {
+      sslPool_[sslIdx] = new WiFiClientSecure();
+      sslPool_[sslIdx]->setInsecure();
+    }
+
     // Heap-allocate the HTTPClient so it survives after doFetch returns.
     HTTPClient *http = new HTTPClient();
     http->setConnectTimeout(10000);
     http->setTimeout(10000);
-    if (!http->begin(e->url.c_str())) {
+    if (!http->begin(*sslPool_[sslIdx], e->url.c_str())) {
       xSemaphoreTake(mutex_, portMAX_DELAY);
       e->ok = false;
       e->errorMsg = "begin() failed";
@@ -305,6 +362,7 @@ class JSHttpFetcher {
       e->stream = nullptr;
       e->streamActive = false;
       xSemaphoreGive(mutex_);
+      releaseSsl(sslIdx);
       delete http;
       return;
     }
@@ -325,6 +383,7 @@ class JSHttpFetcher {
       e->stream = nullptr;
       e->streamActive = false;
       xSemaphoreGive(mutex_);
+      releaseSsl(sslIdx);
       delete http;
       return;
     }
@@ -395,6 +454,27 @@ class JSHttpFetcher {
     return JS_NewBool(ctx, e->stream->connected());
   }
 
+  static JSValue stream_setTimeout(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    JSValue idVal = JS_GetPropertyStr(ctx, this_val, "_streamId");
+    uint32_t id;
+    JS_ToUint32(ctx, &id, idVal);
+    JS_FreeValue(ctx, idVal);
+    if (!instance) return JS_ThrowInternalError(ctx, "no fetcher instance");
+    Entry *e = (id < instance->liveStreams.size())
+                 ? instance->liveStreams[id] : nullptr;
+    if (!e || !e->stream || !e->streamActive)
+      return JS_ThrowReferenceError(ctx, "stream closed");
+    uint32_t ms = 10000;
+    if (argc >= 1) JS_ToUint32(ctx, &ms, argv[0]);
+    if (ms == 0) {
+      e->closeDeadlineMs = 0;  // no timeout
+    } else {
+      e->closeDeadlineMs = millis() + ms;
+    }
+    return JS_UNDEFINED;
+  }
+
   static JSValue stream_close(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv) {
     JSValue idVal = JS_GetPropertyStr(ctx, this_val, "_streamId");
@@ -409,12 +489,21 @@ class JSHttpFetcher {
     if (id >= liveStreams.size()) return;
     Entry *e = liveStreams[id];
     if (!e) return;
+    // Don't call http->end() here — that frees the mbedTLS context
+    // and creates a fragmentation window. The free happens in doFetch()
+    // right before the re-allocation, back-to-back on the background task.
     if (e->http) {
       e->streamActive = false;
-      e->http->end();
       delete e->http;
       e->http = nullptr;
       e->stream = nullptr;
+    }
+    // Release SSL back to pool
+    if (e->sslIdx >= 0) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+      releaseSsl(e->sslIdx);
+      xSemaphoreGive(mutex_);
+      e->sslIdx = -1;
     }
     if (e->resolving_funcs[0] != JS_UNDEFINED) {
       JS_FreeValue(e->ctx, e->resolving_funcs[0]);
@@ -426,6 +515,17 @@ class JSHttpFetcher {
     liveStreams[id] = nullptr;
   }
 
+  void sweepTimeouts(JSContext *ctx) {
+    uint32_t now = millis();
+    for (size_t i = 0; i < liveStreams.size(); i++) {
+      Entry *e = liveStreams[i];
+      if (!e || !e->streamActive) continue;
+      if (e->closeDeadlineMs > 0 && now >= e->closeDeadlineMs) {
+        closeStream(i);
+      }
+    }
+  }
+
   JSValue createStreamObject(JSContext *ctx, Entry *e) {
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "_streamId", JS_NewInt32(ctx, e->streamId));
@@ -435,17 +535,29 @@ class JSHttpFetcher {
       JS_NewCFunction(ctx, stream_available, "available", 0));
     JS_SetPropertyStr(ctx, obj, "connected",
       JS_NewCFunction(ctx, stream_connected, "connected", 0));
+    JS_SetPropertyStr(ctx, obj, "setTimeout",
+      JS_NewCFunction(ctx, stream_setTimeout, "setTimeout", 1));
     JS_SetPropertyStr(ctx, obj, "close",
       JS_NewCFunction(ctx, stream_close, "close", 0));
     return obj;
   }
 
  public:
-  JSHttpFetcher() {}
+  JSHttpFetcher() {
+    for (int i = 0; i < SSL_POOL_SIZE; i++) {
+      sslPool_[i] = nullptr;
+      sslInUse_[i] = false;
+    }
+  }
 
   void init() {
     instance = this;
     if (task_) return;
+    // No pre-allocation — SSL clients are created lazily in doFetch().
+    for (int i = 0; i < SSL_POOL_SIZE; i++) {
+      sslPool_[i] = nullptr;
+      sslInUse_[i] = false;
+    }
     mutex_ = xSemaphoreCreateMutex();
     notify_ = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(taskEntry, "js_http", 8192, this, 1, &task_, 0);
@@ -475,6 +587,14 @@ class JSHttpFetcher {
       }
     }
     liveStreams.clear();
+    // Clean up SSL pool
+    for (int i = 0; i < SSL_POOL_SIZE; i++) {
+      if (sslPool_[i]) {
+        sslPool_[i]->stop();
+        delete sslPool_[i];
+        sslPool_[i] = nullptr;
+      }
+    }
   }
 
   JSValue fetch(JSContext *ctx, JSValueConst jsUrl, JSValueConst options) {
@@ -513,6 +633,8 @@ class JSHttpFetcher {
     e->stream = nullptr;
     e->streamActive = false;
     e->streamId = -1;
+    e->sslIdx = -1;
+    e->closeDeadlineMs = 0;
     e->resolving_funcs[0] = JS_UNDEFINED;
     e->resolving_funcs[1] = JS_UNDEFINED;
     JS_FreeCString(ctx, url);
@@ -560,6 +682,8 @@ class JSHttpFetcher {
           liveStreams.resize(e->streamId + 1, nullptr);
         }
         liveStreams[e->streamId] = e;
+        // Default 10s auto-close timeout
+        e->closeDeadlineMs = millis() + 10000;
 
         JSValue resp = JS_NewObject(ectx);
         JS_SetPropertyStr(ectx, resp, "status", JS_NewInt32(ectx, e->status));
@@ -576,6 +700,8 @@ class JSHttpFetcher {
       JS_FreeValue(ectx, rfs[0]);
       JS_FreeValue(ectx, rfs[1]);
     }
+    // Auto-close timed-out streams
+    sweepTimeouts(ctx);
   }
 };
 
