@@ -1,0 +1,1 @@
+chain=()=>{fetch("https://www.example.com").then((resp,err)=>{if(err){console.log("error:"+err);}else console.log(resp.body.read());resp.body.close();gc();console.log("freeHeap:"+freeHeap());setTimeout(()=>{chain();},1);})}

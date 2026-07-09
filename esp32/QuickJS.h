@@ -16,6 +16,7 @@
 class ESP32QuickJS;
 
 #include <Arduino.h>
+#include <WiFi.h>
 
 #include "RotaryEncoder.h"
 #include "JSRotaryEncoder.h"
@@ -60,8 +61,8 @@ extern int currentTelnetId;
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <ArduinoHttpClient.h>
+#include <ESP_SSLClient.h>
 #include <Server.h>
 #include <StreamString.h>
 
@@ -259,21 +260,21 @@ class JSHttpFetcher {
     std::string errorMsg;
 
     // Streaming phase (valid after done && ok):
-    HTTPClient *http;          // heap-allocated, owned by Entry
-    WiFiClient *stream;        // = http->getStreamPtr()
+    HttpClient *http;          // heap-allocated, owned by Entry (ArduinoHttpClient)
+    WiFiClient *stream;        // base TCP client (plain)
+    ESP_SSLClient *sslClient;  // SSL client if used
+    Client *client;           // generic client pointer passed to HTTPClient.begin()
     volatile bool streamActive;
     int streamId;
 
-    // SSL pool slot (-1 = not using pool)
-    int sslIdx;
+    // Response headers (set by background task after status line):
+    std::vector<std::pair<std::string, std::string>> headers;
+
     // Auto-close deadline in millis (0 = no timeout)
     uint32_t closeDeadlineMs;
   };
 
  private:
-  static const int SSL_POOL_SIZE = 4;
-  WiFiClientSecure *sslPool_[SSL_POOL_SIZE];
-  bool sslInUse_[SSL_POOL_SIZE];
 
   std::vector<Entry *> queue;          // pending (pre-headers)
   std::vector<Entry *> workQueue_;     // waiting for the task
@@ -284,23 +285,6 @@ class JSHttpFetcher {
   SemaphoreHandle_t notify_ = nullptr;
   volatile bool stopping_ = false;
 
-  // Acquire an SSL pool slot. Returns index (0..SSL_POOL_SIZE-1) or -1 if full.
-  // Caller MUST hold mutex_.
-  int acquireSsl() {
-    for (int i = 0; i < SSL_POOL_SIZE; i++) {
-      if (!sslInUse_[i]) {
-        sslInUse_[i] = true;
-        return i;
-      }
-    }
-    return -1;  // pool exhausted
-  }
-
-  // Release an SSL pool slot. Caller MUST hold mutex_.
-  void releaseSsl(int idx) {
-    if (idx < 0 || idx >= SSL_POOL_SIZE) return;
-    sslInUse_[idx] = false;
-  }
 
   static void taskEntry(void *arg) {
     static_cast<JSHttpFetcher *>(arg)->fetchTask();
@@ -320,61 +304,84 @@ class JSHttpFetcher {
   }
 
   void doFetch(Entry *e) {
-    // Acquire an SSL pool slot (must hold mutex_).
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    int sslIdx = acquireSsl();
-    xSemaphoreGive(mutex_);
-    if (sslIdx < 0) {
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->ok = false;
-      e->errorMsg = "SSL pool exhausted";
-      e->done = true;
-      e->http = nullptr;
-      e->stream = nullptr;
-      e->streamActive = false;
-      e->sslIdx = -1;
-      xSemaphoreGive(mutex_);
-      return;
-    }
-    e->sslIdx = sslIdx;
+    Serial.println("Fetch Called");
+    WiFiClient *baseClient = new WiFiClient();
+    // Set a connect timeout so TCP connect doesn't block forever.
+    baseClient->setTimeout(10000);
 
-    // If this slot was used before, close the old connection now.
-    // This frees the mbedTLS context. The re-allocation happens
-    // immediately below in http->begin(), back-to-back on the
-    // background task with zero fragmentation window.
-    if (sslPool_[sslIdx]) {
-      sslPool_[sslIdx]->stop();
-    } else {
-      sslPool_[sslIdx] = new WiFiClientSecure();
-      sslPool_[sslIdx]->setInsecure();
+    // Use generic Client pointer to allow both plain and SSL clients
+    Client *usedClient = baseClient;
+    // if it is an ssl connection, wrap the baseClient in an ESP_SSLClient
+    ESP_SSLClient *sslClient = nullptr;
+    if (e->url.find("https://") == 0) {
+    Serial.println("ssl Called");
+      sslClient = new ESP_SSLClient();
+      sslClient->setInsecure(); // Accept any certificate (for testing)
+      sslClient->setClient(baseClient);
+      usedClient = sslClient;
+    Serial.println("ssl allocated");
     }
 
     // Heap-allocate the HTTPClient so it survives after doFetch returns.
-    HTTPClient *http = new HTTPClient();
-    http->setConnectTimeout(10000);
+    // Parse URL to extract host, port, and path for ArduinoHttpClient
+    String url = String(e->url.c_str());
+    int protoPos = url.indexOf("://");
+    if (protoPos == -1) protoPos = 0; else protoPos += 3;
+    int pathPos = url.indexOf('/', protoPos);
+    String hostPort = url.substring(protoPos, pathPos);
+    String path = url.substring(pathPos);
+    if (path.length() == 0) path = "/"; // --add logic to ask the remote system for the default file if it ends with '/'
+    String host = hostPort;
+    bool isHttps = (e->url.find("https://") == 0);
+    int port =  isHttps ? 443 : 80;  //-- re
+    int colonPos = hostPort.indexOf(':');
+    if (colonPos != -1) {
+        host = hostPort.substring(0, colonPos);
+        port = hostPort.substring(colonPos + 1).toInt();
+    }
+Serial.println("Connecting to " + host + ":" + String(port) + path);
+    HttpClient *http = new HttpClient(*usedClient, host.c_str(), port);
     http->setTimeout(10000);
-    if (!http->begin(*sslPool_[sslIdx], e->url.c_str())) {
+    int code;
+    // Use ArduinoHttpClient methods for request types
+    if (!e->method.empty() && e->method != "GET") {
+      // POST/PUT etc. with JSON payload using ArduinoHttpClient
+      code = http->post(path.c_str(), "application/json", e->body.c_str());
+      Serial.println("POST/PUT request sent, code: " + String(code));
+      if(code==0){ // I *believe that this just means that we were able to talk to them
+        code=http->responseStatusCode();
+        Serial.println("POST/PUT response code: " + String(code));
+        
+      }
+    } else {
+      // Simple GET request using ArduinoHttpClient
+      code = http->get(path.c_str());
+      Serial.println("GET request sent to  "+path+", code: " + String(code));
+      if(code==0){ // I *believe that this just means that we were able to talk to them
+        code=http->responseStatusCode();
+        Serial.println("GET response code: " + String(code));
+        
+      }
+    }
+    if (code <= 0 || code >= 400) {
+      if(code >= 400){
+Serial.println("HTTP error: " + String(code));
       xSemaphoreTake(mutex_, portMAX_DELAY);
       e->ok = false;
-      e->errorMsg = "begin() failed";
+//      e->errorMsg = "HTTP error: " + std::to_string(code);
+        // read body into error message
+        e-> errorMsg = http->responseBody().c_str();
       e->done = true;
       e->http = nullptr;
       e->stream = nullptr;
       e->streamActive = false;
       xSemaphoreGive(mutex_);
-      releaseSsl(sslIdx);
       delete http;
+      if (sslClient) delete sslClient;
+      delete baseClient;
       return;
-    }
-    int code;
-    if (!e->method.empty() && e->method != "GET") {
-      code = http->sendRequest(e->method.c_str(),
-                               (uint8_t *)e->body.c_str(),
-                               e->body.length());
-    } else {
-      code = http->GET();
-    }
-    if (code <= 0) {
+      }else{
+      Serial.println("HTTP error: " + String(code));
       xSemaphoreTake(mutex_, portMAX_DELAY);
       e->ok = false;
       e->errorMsg = "HTTP error: " + std::to_string(code);
@@ -383,17 +390,36 @@ class JSHttpFetcher {
       e->stream = nullptr;
       e->streamActive = false;
       xSemaphoreGive(mutex_);
-      releaseSsl(sslIdx);
       delete http;
+      if (sslClient) delete sslClient;
+      delete baseClient;
       return;
+      }
     }
+    Serial.println("HTTP request successful, status code: " + String(code));
+    // Yield briefly to let other FreeRTOS tasks run before we start heavy work.
+    vTaskDelay(1);
     // Success — keep connection alive for streaming reads.
-    // Store the heap-allocated http so the stream object can access it.
+    // Store the heap-allocated http and client pointers for later use.
     e->http = http;
-    e->stream = http->getStreamPtr();
+    e->stream = baseClient;
+    e->sslClient = sslClient;
+    e->client = usedClient; // generic client used for begin()
     e->streamActive = true;
     e->ok = true;
     e->status = code;
+    // Read response headers into the Entry using the library's
+    // headerAvailable()/readHeaderName()/readHeaderValue() API.
+    // This does NOT touch the body — JS reads the body later via stream.
+    Serial.println("Reading response headers...");
+    while (http->headerAvailable()) {
+      String hName = http->readHeaderName();
+      String hVal  = http->readHeaderValue();
+      e->headers.push_back({hName.c_str(), hVal.c_str()});
+      // Yield after each header to avoid starving other tasks.
+      vTaskDelay(1);
+    }
+    // notify JS to resolve promise, and relent control toJS
     e->done = true;
   }
 
@@ -409,14 +435,15 @@ class JSHttpFetcher {
     if (!instance) return JS_ThrowInternalError(ctx, "no fetcher instance");
     Entry *e = (id < instance->liveStreams.size())
                  ? instance->liveStreams[id] : nullptr;
-    if (!e || !e->stream || !e->streamActive)
+    if (!e || !e->http || !e->streamActive)
       return JS_ThrowReferenceError(ctx, "stream closed");
     uint32_t maxLen = 1024;
     if (argc >= 1) JS_ToUint32(ctx, &maxLen, argv[0]);
     if (maxLen > 4096) maxLen = 4096;
     uint8_t *buf = (uint8_t *)js_malloc(ctx, maxLen);
     if (!buf) return JS_EXCEPTION;
-    int actual = e->stream->read(buf, maxLen);
+    // Read from HttpClient directly — it handles chunked encoding internally.
+    int actual = e->http->read(buf, maxLen);
     if (actual <= 0) {
       js_free(ctx, buf);
       return JS_NewString(ctx, "");
@@ -435,9 +462,11 @@ class JSHttpFetcher {
     if (!instance) return JS_NewInt32(ctx, -1);
     Entry *e = (id < instance->liveStreams.size())
                  ? instance->liveStreams[id] : nullptr;
-    if (!e || !e->stream || !e->streamActive)
+    if (!e) return JS_NewInt32(ctx, -1);
+    if (!e->http || !e->streamActive)
       return JS_NewInt32(ctx, -1);
-    return JS_NewInt32(ctx, e->stream->available());
+    // HttpClient::available() handles chunked encoding internally.
+    return JS_NewInt32(ctx, e->http->available());
   }
 
   static JSValue stream_connected(JSContext *ctx, JSValueConst this_val,
@@ -449,9 +478,10 @@ class JSHttpFetcher {
     if (!instance) return JS_NewBool(ctx, false);
     Entry *e = (id < instance->liveStreams.size())
                  ? instance->liveStreams[id] : nullptr;
-    if (!e || !e->stream || !e->streamActive)
+    if (!e) return JS_NewBool(ctx, false);
+    if (!e->http || !e->streamActive)
       return JS_NewBool(ctx, false);
-    return JS_NewBool(ctx, e->stream->connected());
+    return JS_NewBool(ctx, e->http->connected());
   }
 
   static JSValue stream_setTimeout(JSContext *ctx, JSValueConst this_val,
@@ -463,7 +493,7 @@ class JSHttpFetcher {
     if (!instance) return JS_ThrowInternalError(ctx, "no fetcher instance");
     Entry *e = (id < instance->liveStreams.size())
                  ? instance->liveStreams[id] : nullptr;
-    if (!e || !e->stream || !e->streamActive)
+    if (!e || !e->http || !e->streamActive)
       return JS_ThrowReferenceError(ctx, "stream closed");
     uint32_t ms = 10000;
     if (argc >= 1) JS_ToUint32(ctx, &ms, argv[0]);
@@ -489,21 +519,20 @@ class JSHttpFetcher {
     if (id >= liveStreams.size()) return;
     Entry *e = liveStreams[id];
     if (!e) return;
-    // Don't call http->end() here — that frees the mbedTLS context
-    // and creates a fragmentation window. The free happens in doFetch()
-    // right before the re-allocation, back-to-back on the background task.
     if (e->http) {
+      e->http->stop();
       e->streamActive = false;
       delete e->http;
       e->http = nullptr;
       e->stream = nullptr;
     }
-    // Release SSL back to pool
-    if (e->sslIdx >= 0) {
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      releaseSsl(e->sslIdx);
-      xSemaphoreGive(mutex_);
-      e->sslIdx = -1;
+    if(e->sslClient) {
+      delete e->sslClient;
+      e->sslClient = nullptr;
+    }
+    if(e->stream) {
+      delete e->stream;
+      e->stream = nullptr;
     }
     if (e->resolving_funcs[0] != JS_UNDEFINED) {
       JS_FreeValue(e->ctx, e->resolving_funcs[0]);
@@ -544,20 +573,14 @@ class JSHttpFetcher {
 
  public:
   JSHttpFetcher() {
-    for (int i = 0; i < SSL_POOL_SIZE; i++) {
-      sslPool_[i] = nullptr;
-      sslInUse_[i] = false;
-    }
+  
   }
 
   void init() {
     instance = this;
     if (task_) return;
     // No pre-allocation — SSL clients are created lazily in doFetch().
-    for (int i = 0; i < SSL_POOL_SIZE; i++) {
-      sslPool_[i] = nullptr;
-      sslInUse_[i] = false;
-    }
+   
     mutex_ = xSemaphoreCreateMutex();
     notify_ = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(taskEntry, "js_http", 8192, this, 1, &task_, 0);
@@ -578,7 +601,7 @@ class JSHttpFetcher {
     queue.clear();
     for (auto *e : liveStreams) {
       if (e) {
-        if (e->http) { e->http->end(); delete e->http; }
+        if (e->http) { e->http->stop(); delete e->http; }
         if (e->resolving_funcs[0] != JS_UNDEFINED) {
           JS_FreeValue(e->ctx, e->resolving_funcs[0]);
           JS_FreeValue(e->ctx, e->resolving_funcs[1]);
@@ -587,14 +610,7 @@ class JSHttpFetcher {
       }
     }
     liveStreams.clear();
-    // Clean up SSL pool
-    for (int i = 0; i < SSL_POOL_SIZE; i++) {
-      if (sslPool_[i]) {
-        sslPool_[i]->stop();
-        delete sslPool_[i];
-        sslPool_[i] = nullptr;
-      }
-    }
+   
   }
 
   JSValue fetch(JSContext *ctx, JSValueConst jsUrl, JSValueConst options) {
@@ -633,7 +649,6 @@ class JSHttpFetcher {
     e->stream = nullptr;
     e->streamActive = false;
     e->streamId = -1;
-    e->sslIdx = -1;
     e->closeDeadlineMs = 0;
     e->resolving_funcs[0] = JS_UNDEFINED;
     e->resolving_funcs[1] = JS_UNDEFINED;
@@ -687,6 +702,13 @@ class JSHttpFetcher {
 
         JSValue resp = JS_NewObject(ectx);
         JS_SetPropertyStr(ectx, resp, "status", JS_NewInt32(ectx, e->status));
+        // Build headers object from the Entry's header list.
+        JSValue headersObj = JS_NewObject(ectx);
+        for (auto &h : e->headers) {
+          JS_SetPropertyStr(ectx, headersObj, h.first.c_str(),
+                            JS_NewString(ectx, h.second.c_str()));
+        }
+        JS_SetPropertyStr(ectx, resp, "headers", headersObj);
         JS_SetPropertyStr(ectx, resp, "body", createStreamObject(ectx, e));
         JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &resp);
         JS_FreeValue(ectx, resp);
