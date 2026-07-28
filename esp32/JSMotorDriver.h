@@ -11,7 +11,7 @@
 
 #pragma once
 #include "MotorDriver.h"
-#include "quickjs.h"
+#include "../quickjs.h"
 #include <vector>
 
 class JSMotorDriver {

@@ -13,7 +13,7 @@
 #pragma once
 
 #include "RotaryEncoder.h"
-#include "quickjs.h"
+#include "../quickjs.h"
 
 class JSRotaryEncoder {
  public:

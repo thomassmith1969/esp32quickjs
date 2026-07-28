@@ -23,6 +23,10 @@ class ESP32QuickJS;
 #include "MotorDriver.h"
 #include "JSMotorDriver.h"
 
+#include "JSTelnetServer.h"
+
+#include "JSRepl.h"
+
 #include "JSStash.h"
 
 #include <algorithm>
@@ -2944,6 +2948,10 @@ class ESP32QuickJS {
     espNow.loop();
     motorDriver.loop(ctx);
 
+    // Telnet REPL: drain per-client buffers and pump incoming
+    // connections. Owned entirely by the library.
+    if (g_jstelnet) g_jstelnet->loop();
+
     // Serial/UART data polling — fire onData callbacks when data arrives.
     // Non-blocking: available() returns 0 if nothing to read.
     // We read only what's already available — never blocks.
@@ -3221,6 +3229,7 @@ class ESP32QuickJS {
       qjs_->spi.loop(ctx_);
       qjs_->espNow.loop();
       qjs_->motorDriver.loop(ctx_);
+      if (g_jstelnet) g_jstelnet->loop();
 
       // Serial/UART data polling during blocking waits.
       if (qjs_->serial1 && qjs_->serial1->available() > 0 && !JS_IsUndefined(qjs_->serial1Cb)) {
@@ -4467,6 +4476,19 @@ class ESP32QuickJS {
         ctx, esp32, esp32_funcs,
         sizeof(esp32_funcs) / sizeof(JSCFunctionListEntry));
 #endif
+
+    // ---- Telnet REPL server ----
+    // Owns a single global JSTelnetServer instance (g_jstelnet). The
+    // Telnet namespace exposes Telnet.start() / Telnet.stop() so JS
+    // startup scripts can opt-in to the telnet REPL on port 23.
+    // The library also pumps the per-client REPL state machines from
+    // ESP32QuickJS::loop() and from JSBlockingGuard::tick() so the
+    // example app never has to know telnet exists.
+    if (g_jstelnet) {
+      g_jstelnet->attach(this);
+      JS_SetPropertyStr(ctx, global, "Telnet",
+                        g_jstelnet->getJSNamespace(ctx));
+    }
   }
 
   static JSValue console_log(JSContext *ctx, JSValueConst jsThis, int argc,
