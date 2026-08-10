@@ -61,8 +61,7 @@ extern int currentTelnetId;
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-#include <HTTPClient.h>
-#include <Server.h>
+#include <WiFi.h>
 #include <StreamString.h>
 
 #include <driver/i2c.h>
@@ -227,407 +226,6 @@ class JSWorker {
   static JSWorker *instance;
 };
 inline JSWorker* JSWorker::instance = nullptr;
-
-// Non-blocking HTTP fetcher. All blocking I/O (HTTPClient::sendRequest/GET,
-// reading the response body) happens on a FreeRTOS task so the JS main loop
-// never stalls. The main loop just polls a "done" flag and resolves the
-// JS Promise when the background task has the full response.
-class JSHttpFetcher {
- public:
-  struct Entry {
-    JSContext *ctx;
-    JSValue resolving_funcs[2];
-    // Input (set by JS thread before queuing):
-    std::string url;
-    std::string method;
-    std::string body;
-    // Output (written by task under mutex, read by JS thread):
-    volatile bool done;
-    volatile bool ok;       // true = success, false = error
-    int status;
-    std::string responseHeaders;
-    std::string responseBody;
-    std::string errorMsg;
-  };
-
- private:
-  std::vector<Entry *> queue;          // all pending entries (JS thread)
-  std::vector<Entry *> workQueue_;     // entries waiting for the task
-  TaskHandle_t task_ = nullptr;
-  SemaphoreHandle_t mutex_ = nullptr;
-  SemaphoreHandle_t notify_ = nullptr;
-  volatile bool stopping_ = false;
-
-  static void taskEntry(void *arg) {
-    static_cast<JSHttpFetcher *>(arg)->fetchTask();
-    vTaskDelete(nullptr);
-  }
-
-  void fetchTask() {
-    while (true) {
-      xSemaphoreTake(notify_, portMAX_DELAY);
-      if (stopping_) break;
-      std::vector<Entry *> work;
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      work.swap(workQueue_);
-      xSemaphoreGive(mutex_);
-      for (auto *e : work) doFetch(e);
-    }
-  }
-
-  void doFetch(Entry *e) {
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(10000);
-    if (!http.begin(e->url.c_str())) {
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->ok = false;
-      e->errorMsg = "begin() failed";
-      e->done = true;
-      xSemaphoreGive(mutex_);
-      return;
-    }
-    int code;
-    if (!e->method.empty() && e->method != "GET") {
-      code = http.sendRequest(e->method.c_str(),
-                             (uint8_t *)e->body.c_str(),
-                             e->body.length());
-    } else {
-      code = http.GET();
-    }
-    if (code <= 0) {
-      xSemaphoreTake(mutex_, portMAX_DELAY);
-      e->ok = false;
-      e->errorMsg = "HTTP error: " + std::to_string(code);
-      e->done = true;
-      xSemaphoreGive(mutex_);
-      http.end();
-      return;
-    }
-    String bodyStr = http.getString();
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    e->ok = true;
-    e->status = code;
-    e->responseBody = std::string(bodyStr.c_str());
-    e->done = true;
-    xSemaphoreGive(mutex_);
-    http.end();
-  }
-
- public:
-  JSHttpFetcher() {}
-
-  void init() {
-    if (task_) return;
-    mutex_ = xSemaphoreCreateMutex();
-    notify_ = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(taskEntry, "js_http", 8192, this, 1, &task_, 0);
-  }
-
-  ~JSHttpFetcher() {
-    stopping_ = true;
-    if (notify_) xSemaphoreGive(notify_);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if (task_) { vTaskDelete(task_); task_ = nullptr; }
-    if (mutex_) { vSemaphoreDelete(mutex_); mutex_ = nullptr; }
-    if (notify_) { vSemaphoreDelete(notify_); notify_ = nullptr; }
-    for (auto *e : queue) {
-      JS_FreeValue(e->ctx, e->resolving_funcs[0]);
-      JS_FreeValue(e->ctx, e->resolving_funcs[1]);
-      delete e;
-    }
-    queue.clear();
-  }
-
-  JSValue fetch(JSContext *ctx, JSValueConst jsUrl, JSValueConst options) {
-    if (WiFi.status() != WL_CONNECTED) {
-      return JS_ThrowTypeError(ctx, "WiFi not connected");
-    }
-    const char *url = JS_ToCString(ctx, jsUrl);
-    if (!url) return JS_EXCEPTION;
-
-    std::string method = "GET";
-    std::string body = "";
-    if (JS_IsObject(options)) {
-      JSValue m = JS_GetPropertyStr(ctx, options, "method");
-      if (JS_IsString(m)) {
-        const char *s = JS_ToCString(ctx, m);
-        if (s) { method = s; JS_FreeCString(ctx, s); }
-      }
-      JS_FreeValue(ctx, m);
-      JSValue b = JS_GetPropertyStr(ctx, options, "body");
-      if (JS_IsString(b)) {
-        const char *s = JS_ToCString(ctx, b);
-        if (s) { body = s; JS_FreeCString(ctx, s); }
-      }
-      JS_FreeValue(ctx, b);
-    }
-
-    Entry *e = new Entry();
-    e->ctx = ctx;
-    e->url = url;
-    e->method = method;
-    e->body = body;
-    e->done = false;
-    e->ok = false;
-    e->status = 0;
-    e->resolving_funcs[0] = JS_UNDEFINED;
-    e->resolving_funcs[1] = JS_UNDEFINED;
-    JS_FreeCString(ctx, url);
-
-    JSValue promise = JS_NewPromiseCapability(ctx, e->resolving_funcs);
-    if (JS_IsException(promise)) {
-      delete e;
-      return JS_EXCEPTION;
-    }
-
-    // Queue for the background task.
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    queue.push_back(e);
-    workQueue_.push_back(e);
-    xSemaphoreGive(mutex_);
-    xSemaphoreGive(notify_);
-
-    return promise;
-  }
-
-  void loop(JSContext *ctx) {
-    std::vector<Entry*> doneEntries;
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-    for (auto it = queue.begin(); it != queue.end(); ) {
-      if ((*it)->done) {
-        doneEntries.push_back(*it);
-        it = queue.erase(it);
-      } else {
-        ++it;
-      }
-    }
-    xSemaphoreGive(mutex_);
-
-    for (auto e : doneEntries) {
-      bool ok = e->ok;
-      int status = e->status;
-      std::string body = e->responseBody;
-      std::string err = e->errorMsg;
-      JSValue rfs[2] = {e->resolving_funcs[0], e->resolving_funcs[1]};
-      JSContext *ectx = e->ctx;
-
-      if (ok) {
-        JSValue r = JS_NewObject(ectx);
-        JS_SetPropertyStr(ectx, r, "status", JS_NewInt32(ectx, status));
-        JS_SetPropertyStr(ectx, r, "body", JS_NewString(ectx, body.c_str()));
-        JS_Call(ectx, rfs[0], JS_UNDEFINED, 1, &r);
-        JS_FreeValue(ectx, r);
-      } else {
-        JSValue errv = JS_NewString(ectx, err.c_str());
-        JS_Call(ectx, rfs[1], JS_UNDEFINED, 1, &errv);
-        JS_FreeValue(ectx, errv);
-      }
-      JS_FreeValue(ectx, rfs[0]);
-      JS_FreeValue(ectx, rfs[1]);
-      delete e;
-    }
-  }
-};
-
-class JSConnection {
-public:
-    WiFiClient* client;
-    JSContext* ctx;
-    
-    struct PendingOp {
-        enum Type { READ, WRITE, CLOSE };
-        Type type;
-        JSValue resolve;
-        JSValue reject;
-        std::string data;
-        uint32_t len;
-    };
-    std::vector<PendingOp*> pending;
-
-    JSConnection(JSContext* ctx, WiFiClient* client) : ctx(ctx), client(client) {}
-    ~JSConnection() {
-        for (auto p : pending) {
-            JS_FreeValue(ctx, p->resolve);
-            JS_FreeValue(ctx, p->reject);
-            delete p;
-        }
-        if (client) delete client;
-    }
-
-    void poll() {
-        auto it = pending.begin();
-        while (it != pending.end()) {
-            PendingOp* op = *it;
-            bool resolved = false;
-            if (op->type == JSConnection::PendingOp::READ) {
-                if (client->available() > 0) {
-                    int available = client->available();
-                    int toRead = std::min(available, (int)op->len);
-                    std::vector<char> buf(toRead);
-                    client->readBytes(buf.data(), toRead);
-                    JSValue res = JS_NewString(ctx, buf.data());
-                    JS_Call(ctx, op->resolve, JS_UNDEFINED, 1, &res);
-                    JS_FreeValue(ctx, res);
-                    resolved = true;
-                }
-            } else if (op->type == JSConnection::PendingOp::WRITE) {
-                if (client->availableForWrite() > 0) {
-                    client->write((const uint8_t*)op->data.c_str(), op->data.length());
-                    JSValue res = JS_NewBool(ctx, true);
-                    JS_Call(ctx, op->resolve, JS_UNDEFINED, 1, &res);
-                    JS_FreeValue(ctx, res);
-                    resolved = true;
-                }
-            } else if (op->type == JSConnection::PendingOp::CLOSE) {
-                client->stop();
-                JSValue res = JS_NewBool(ctx, true);
-                JS_Call(ctx, op->resolve, JS_UNDEFINED, 1, &res);
-                JS_FreeValue(ctx, res);
-                resolved = true;
-            }
-
-            if (resolved) {
-                JS_FreeValue(ctx, op->resolve);
-                JS_FreeValue(ctx, op->reject);
-                delete op;
-                it = pending.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-};
-
-class JSWebServer {
-    WiFiServer server;
-    JSValue callback = JS_UNDEFINED;
-    JSContext* ctx = nullptr;
-    std::vector<JSConnection*> connections;
-
-public:
-    void serve(JSContext* ctx, uint16_t port, JSValue callback) {
-        this->ctx = ctx;
-        this->callback = JS_DupValue(ctx, callback);
-        server.begin(port);
-    }
-
-    void loop() {
-        if (!ctx) return;
-
-        WiFiClient client = server.available();
-        if (client) {
-            JSConnection* conn = new JSConnection(ctx, new WiFiClient(client));
-            connections.push_back(conn);
-            
-            JSValue jsConn = createConnection(ctx, conn);
-            JS_Call(ctx, callback, JS_UNDEFINED, 1, &jsConn);
-            JS_FreeValue(ctx, jsConn);
-        }
-
-        auto it = connections.begin();
-        while (it != connections.end()) {
-            JSConnection* conn = *it;
-            if (!conn->client || !conn->client->connected()) {
-                delete conn;
-                it = connections.erase(it);
-            } else {
-                conn->poll();
-                ++it;
-            }
-        }
-    }
-
-    static JSValue createConnection(JSContext* ctx, JSConnection* conn) {
-        JSValue obj = JS_NewObject(ctx);
-        JSValue ptr = JS_NewUint32(ctx, (uintptr_t)conn);
-        JS_SetPropertyStr(ctx, obj, "__conn_ptr", ptr);
-        JS_FreeValue(ctx, ptr);
-
-        static const JSCFunctionListEntry conn_funcs[] = {
-            {"read", 1, JS_DEF_CFUNC, 0, {func: {1, JS_CFUNC_generic, conn_read}}},
-            {"write", 1, JS_DEF_CFUNC, 0, {func: {1, JS_CFUNC_generic, conn_write}}},
-            {"close", 0, JS_DEF_CFUNC, 0, {func: {0, JS_CFUNC_generic, conn_close}}},
-        };
-        JS_SetPropertyFunctionList(ctx, obj, conn_funcs, 3);
-        return obj;
-    }
-
-    static JSValue conn_read(JSContext* ctx, JSValueConst jsThis, int argc, JSValueConst* argv) {
-        JSValue ptrVal = JS_GetPropertyStr(ctx, (JSValue)jsThis, "__conn_ptr");
-        uint32_t ptr;
-        JS_ToUint32(ctx, &ptr, ptrVal);
-        JS_FreeValue(ctx, ptrVal);
-        JSConnection* conn = (JSConnection*)ptr;
-        
-        uint32_t len = 1024;
-        if (argc > 0) {
-            JS_ToUint32(ctx, &len, argv[0]);
-        }
-
-        JSValue resolving_funcs[2];
-        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-        
-        JSConnection::PendingOp* op = new JSConnection::PendingOp{
-            JSConnection::PendingOp::Type::READ,
-            JS_DupValue(ctx, resolving_funcs[0]),
-            JS_DupValue(ctx, resolving_funcs[1]),
-            "",
-            len
-        };
-        conn->pending.push_back(op);
-
-        return promise;
-    }
-
-    static JSValue conn_write(JSContext* ctx, JSValueConst jsThis, int argc, JSValueConst* argv) {
-        JSValue ptrVal = JS_GetPropertyStr(ctx, (JSValue)jsThis, "__conn_ptr");
-        uint32_t ptr;
-        JS_ToUint32(ctx, &ptr, ptrVal);
-        JS_FreeValue(ctx, ptrVal);
-        JSConnection* conn = (JSConnection*)ptr;
-        
-        const char* data = JS_ToCString(ctx, argv[0]);
-        if (!data) return JS_EXCEPTION;
-
-        JSValue resolving_funcs[2];
-        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-        
-        JSConnection::PendingOp* op = new JSConnection::PendingOp{
-            JSConnection::PendingOp::Type::WRITE,
-            JS_DupValue(ctx, resolving_funcs[0]),
-            JS_DupValue(ctx, resolving_funcs[1]),
-            std::string(data),
-            0
-        };
-        conn->pending.push_back(op);
-
-        JS_FreeCString(ctx, data);
-        return promise;
-    }
-
-    static JSValue conn_close(JSContext* ctx, JSValueConst jsThis, int argc, JSValueConst* argv) {
-        JSValue ptrVal = JS_GetPropertyStr(ctx, (JSValue)jsThis, "__conn_ptr");
-        uint32_t ptr;
-        JS_ToUint32(ctx, &ptr, ptrVal);
-        JS_FreeValue(ctx, ptrVal);
-        JSConnection* conn = (JSConnection*)ptr;
-
-        JSValue resolving_funcs[2];
-        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-        
-        JSConnection::PendingOp* op = new JSConnection::PendingOp{
-            JSConnection::PendingOp::Type::CLOSE,
-            JS_DupValue(ctx, resolving_funcs[0]),
-            JS_DupValue(ctx, resolving_funcs[1]),
-            "",
-            0
-        };
-        conn->pending.push_back(op);
-
-        return promise;
-    }
-};
 
 class JSTimer {
   struct TimerEntry {
@@ -2727,8 +2325,6 @@ class ESP32QuickJS {
   // flag — uses on-chip ADC / LEDC / touch hardware).
   JSAnalog analog;
   JSWorker worker;          // centralized background task for I2C/SPI/FS
-  JSHttpFetcher httpFetcher;
-  JSWebServer webServer;
   // DNS captive portal server (WiFi.startDNS) and mDNS (WiFi.startMDNS).
   // Both are lightweight — DNSServer is a UDP poller, ESPmDNS runs in
   // the ESP-IDF background. Neither blocks the main loop.
@@ -2868,8 +2464,6 @@ class ESP32QuickJS {
     // Initialize the centralized worker (one task for I2C/SPI/FS).
     JSWorker::instance = &worker;
     worker.init();
-    // Initialize the non-blocking HTTP fetcher (spawns FreeRTOS task).
-    httpFetcher.init();
     analog.init();
     JSI2C::instance = &i2c;
     JSSPI::instance = &spi;
@@ -2935,8 +2529,6 @@ class ESP32QuickJS {
     // Analog I/O + touch listeners (always available, no flag)
     analog.loop(ctx);
 
-    httpFetcher.loop(ctx);
-    webServer.loop();
     // DNS captive portal: process one pending request per tick.
     // Non-blocking — processNextRequest() returns immediately if no
     // UDP packet is waiting.
@@ -3220,8 +2812,6 @@ class ESP32QuickJS {
         qjs_->timer.ConsumeTimer(ctx_, now);
       }
       qjs_->analog.loop(ctx_);
-      qjs_->httpFetcher.loop(ctx_);
-      qjs_->webServer.loop();
       if (qjs_->dnsRunning) qjs_->dnsServer.processNextRequest();
       qjs_->littlefs.loop(ctx_);
       qjs_->sd.loop(ctx_);
@@ -3449,85 +3039,6 @@ class ESP32QuickJS {
       return m;
     }
 
-    // ---- Synchronous HTTP fetch ----
-    // Fetches a URL and stores the response body in `out`.
-    // Blocks the JS thread while pumping the event loop (JSBlockingGuard)
-    // so timers/WiFi/I2C/etc. all keep running.
-    // Returns true on success, false on failure.
-    bool fetchSync(JSContext *ctx, ESP32QuickJS *qjs,
-                   const std::string &url, std::string &out) {
-      if (WiFi.status() != WL_CONNECTED) return false;
-
-      // Set up a global state object for the fetch result.
-      JSValue g = JS_GetGlobalObject(ctx);
-      JSValue state_obj = JS_NewObject(ctx);
-      JS_SetPropertyStr(ctx, state_obj, "done", JS_NewBool(ctx, false));
-      JS_SetPropertyStr(ctx, state_obj, "ok", JS_NewBool(ctx, false));
-      JS_SetPropertyStr(ctx, state_obj, "body", JS_NewString(ctx, ""));
-      JS_SetPropertyStr(ctx, g, "__fetch_state", state_obj);
-      JS_FreeValue(ctx, g);
-
-      // Evaluate a script that calls WiFi.fetch and chains .then/.catch.
-      std::string script = std::string(
-        "globalThis.__fetch_state.done = false;\n"
-        "globalThis.__fetch_state.ok = false;\n"
-        "globalThis.__fetch_state.body = '';\n"
-        "WiFi.fetch(\"") + url + "\").then(function(r) {\n"
-        "  globalThis.__fetch_state.done = true;\n"
-        "  globalThis.__fetch_state.ok = true;\n"
-        "  globalThis.__fetch_state.body = r.body;\n"
-        "}).catch(function(e) {\n"
-        "  globalThis.__fetch_state.done = true;\n"
-        "  globalThis.__fetch_state.ok = false;\n"
-        "});\n";
-
-      JSValue eval_ret = JS_Eval(ctx, script.c_str(), script.size(),
-                                 "<fetch>", JS_EVAL_TYPE_GLOBAL);
-      if (JS_IsException(eval_ret)) {
-        qjs_dump_exception(ctx, eval_ret);
-        JS_FreeValue(ctx, eval_ret);
-        JSValue gg = JS_GetGlobalObject(ctx);
-        JS_SetPropertyStr(ctx, gg, "__fetch_state", JS_UNDEFINED);
-        JS_FreeValue(ctx, gg);
-        return false;
-      }
-      JS_FreeValue(ctx, eval_ret);
-
-      // Pump the event loop until the fetch completes.
-      JSBlockingGuard guard(ctx, qjs, 10000);
-      guard.wait([&]() {
-        JSValue gg = JS_GetGlobalObject(ctx);
-        JSValue st = JS_GetPropertyStr(ctx, gg, "__fetch_state");
-        JSValue d = JS_GetPropertyStr(ctx, st, "done");
-        bool isDone = JS_ToBool(ctx, d);
-        JS_FreeValue(ctx, d);
-        JS_FreeValue(ctx, st);
-        JS_FreeValue(ctx, gg);
-        return isDone;
-      });
-
-      // Read the result.
-      JSValue gg = JS_GetGlobalObject(ctx);
-      JSValue st = JS_GetPropertyStr(ctx, gg, "__fetch_state");
-      JSValue ok_val = JS_GetPropertyStr(ctx, st, "ok");
-      JSValue body_val = JS_GetPropertyStr(ctx, st, "body");
-      bool wasOk = JS_ToBool(ctx, ok_val);
-      if (wasOk && JS_IsString(body_val)) {
-        const char *str = JS_ToCString(ctx, body_val);
-        if (str) {
-          out = str;
-          JS_FreeCString(ctx, str);
-        }
-      }
-      JS_FreeValue(ctx, ok_val);
-      JS_FreeValue(ctx, body_val);
-      JS_FreeValue(ctx, st);
-      JS_SetPropertyStr(ctx, gg, "__fetch_state", JS_UNDEFINED);
-      JS_FreeValue(ctx, gg);
-
-      return wasOk && !out.empty();
-    }
-
     // ---- Synchronous require() path ----
     // Blocks the JS thread until the module is loaded, but pumps
     // ESP32QuickJS::loop() while waiting so timers/WiFi/I2C keep running.
@@ -3570,24 +3081,12 @@ class ESP32QuickJS {
         }
       }
 
-      // Get the source. If empty, the file wasn't found — try internet.
+      // Get the source. If empty, the file wasn't found.
       std::string src = getSource(module_name);
       if (src.empty()) {
-        if (WiFi.status() == WL_CONNECTED) {
-          std::string url = "http://www.espruino.com/modules/";
-          std::string mod = module_name;
-          if (!mod.empty() && mod[0] == '/') mod = mod.substr(1);
-          if (!fetchSync(ctx, qjs, url + mod + ".min.js", src) &&
-              !fetchSync(ctx, qjs, url + mod + ".js", src)) {
-            return JS_ThrowReferenceError(ctx,
-              "require: module '%s' not found on filesystem or internet",
-              module_name);
-          }
-        } else {
-          return JS_ThrowReferenceError(ctx,
-            "require: module '%s' not found (no WiFi for internet fetch)",
-            module_name);
-        }
+        return JS_ThrowReferenceError(ctx,
+          "require: module '%s' not found on filesystem",
+          module_name);
       }
 
       // Enqueue a QuickJS job to evaluate the module. Jobs run via
@@ -4103,14 +3602,8 @@ class ESP32QuickJS {
         JSCFunctionListEntry{"stop", 0, JS_DEF_CFUNC, 0, {
                                func : {0, JS_CFUNC_generic, wifi_stop}
                              }},
-        JSCFunctionListEntry{"fetch", 2, JS_DEF_CFUNC, 0, {
-                               func : {2, JS_CFUNC_generic, http_fetch}
-                             }},
         JSCFunctionListEntry{"ip", 0, JS_DEF_CFUNC, 0, {
                                func : {0, JS_CFUNC_generic, wifi_ip}
-                             }},
-        JSCFunctionListEntry{"serve", 2, JS_DEF_CFUNC, 0, {
-                               func : {2, JS_CFUNC_generic, wifi_serve}
                              }},
         JSCFunctionListEntry{"startDNS", 0, JS_DEF_CFUNC, 0, {
                                func : {2, JS_CFUNC_generic, wifi_start_dns}
@@ -4133,10 +3626,6 @@ class ESP32QuickJS {
     };
     JS_SetPropertyFunctionList(ctx, wifi, wifi_funcs, sizeof(wifi_funcs) / sizeof(JSCFunctionListEntry));
     // Do not free wifi here, it is owned by the global object
-
-    // Expose fetch as a global function (alias of WiFi.fetch).
-    JS_SetPropertyStr(ctx, global, "fetch",
-                      JS_NewCFunction(ctx, http_fetch, "fetch", 2));
 
     // FS = { LittleFS: { readFile, writeFile, removeFile, listFiles },
     //        SD:       { init, readFile, writeFile, removeFile, listFiles } }
@@ -5213,18 +4702,6 @@ class ESP32QuickJS {
     return JS_NewString(ctx, buf);
   }
 
-  static JSValue wifi_serve(JSContext *ctx, JSValueConst jsThis, int argc, JSValueConst *argv) {
-    if (argc < 2) return JS_EXCEPTION;
-    uint32_t port;
-    JS_ToUint32(ctx, &port, argv[0]);
-    JSValue callback = argv[1];
-    if (!JS_IsFunction(ctx, callback)) return JS_EXCEPTION;
-
-    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
-    qjs->webServer.serve(ctx, (uint16_t)port, callback);
-    return JS_UNDEFINED;
-  }
-
   // WiFi.startDNS(domain, [port=53]) → boolean
   // Starts a DNS server that resolves ALL queries to the device's IP.
   // Used for captive portals when running as an AP.
@@ -5703,12 +5180,6 @@ class ESP32QuickJS {
     if (!ow) return JS_ThrowInternalError(ctx, "OneWire: invalid handle");
     ow->depower();
     return JS_UNDEFINED;
-  }
-
-  static JSValue http_fetch(JSContext *ctx, JSValueConst jsThis, int argc,
-                            JSValueConst *argv) {
-    ESP32QuickJS *qjs = (ESP32QuickJS *)JS_GetContextOpaque(ctx);
-    return qjs->httpFetcher.fetch(ctx, argv[0], argv[1]);
   }
 
   // Auto-mount LittleFS at setup if not already mounted. Mirrors the wifi
