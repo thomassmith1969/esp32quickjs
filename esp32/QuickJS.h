@@ -28,6 +28,7 @@ class ESP32QuickJS;
 #include "JSRepl.h"
 
 #include "JSStash.h"
+#include "JSPromise.h"
 
 #include <algorithm>
 #include <vector>
@@ -5552,7 +5553,7 @@ class ESP32QuickJS {
 };
 
 // Static member definition — must be at file scope.
-void (*ESP32QuickJS::JSBlockingGuard::pumpCallback)() = nullptr;
+inline void (*ESP32QuickJS::JSBlockingGuard::pumpCallback)() = nullptr;
 
 // RotaryEncoder is implemented in its own files (RotaryEncoder.h/.cpp
 // for the native object, JSRotaryEncoder.h/.cpp for the JS wrapper).
