@@ -10,7 +10,7 @@
 // can later call server->removeHandler(handler). Populated in
 // makeRouteHandler, consumed in makeRemoveHandler.
 struct RouteHandlerEntry {
-    AsyncCallbackWebHandler *handler = nullptr;
+    AsyncWebHandler *handler = nullptr;
 };
 static std::unordered_map<uint32_t, RouteHandlerEntry> g_routeHandlers;
 static SemaphoreHandle_t g_routeHandlersMutex = xSemaphoreCreateMutex();
@@ -36,6 +36,14 @@ static JSAtom allAtom = JS_ATOM_NULL;
 static JSAtom useAtom = JS_ATOM_NULL;
 static JSAtom closeAtom = JS_ATOM_NULL;
 static JSAtom removeAtom = JS_ATOM_NULL;
+static JSAtom serveStaticAtom = JS_ATOM_NULL;
+static JSAtom serveSDAtom = JS_ATOM_NULL;
+
+// Monotonic counter for static-file route ids (returned from app.serveStatic
+// and app.serveSD so the caller can pass them to app.remove()). Static routes
+// have no JS handler so JSStash_stash is not used; this counter is the only
+// thing that gives them a unique id.
+static uint32_t g_staticRouteIdCounter = 0;
 
 
 // Wrap a raw ESPAsyncWebServer request pointer in a JS object whose only property is the
@@ -72,7 +80,7 @@ static JSValue wrapRequest(JSContext *ctx, AsyncWebServerRequest *req) {
         
         return JS_UNDEFINED;
     }, "send", 3);
-    JS_DefinePropertyValueStr(ctx, jsReq, "send", JS_DupValue(ctx, sendFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsReq, "send", sendFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
     
     // Add redirect(url, code?) method
     JSValue redirectFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -96,7 +104,7 @@ static JSValue wrapRequest(JSContext *ctx, AsyncWebServerRequest *req) {
         
         return JS_UNDEFINED;
     }, "redirect", 2);
-    JS_DefinePropertyValueStr(ctx, jsReq, "redirect", JS_DupValue(ctx, redirectFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsReq, "redirect", redirectFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
     
     // Add url() getter
     JSValue urlFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -110,7 +118,7 @@ static JSValue wrapRequest(JSContext *ctx, AsyncWebServerRequest *req) {
         AsyncWebServerRequest *req = reinterpret_cast<AsyncWebServerRequest*>(reqPtr);
         return JS_NewString(ctx2, req->url().c_str());
     }, "url", 0);
-    JS_DefinePropertyValueStr(ctx, jsReq, "url", JS_DupValue(ctx, urlFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsReq, "url", urlFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
     
     // Add method() getter
     JSValue methodFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -124,7 +132,7 @@ static JSValue wrapRequest(JSContext *ctx, AsyncWebServerRequest *req) {
         AsyncWebServerRequest *req = reinterpret_cast<AsyncWebServerRequest*>(reqPtr);
         return JS_NewString(ctx2, req->methodToString());
     }, "method", 0);
-    JS_DefinePropertyValueStr(ctx, jsReq, "method", JS_DupValue(ctx, methodFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsReq, "method", methodFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
     
     // Add contentType() getter
     JSValue contentTypeFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -138,7 +146,7 @@ static JSValue wrapRequest(JSContext *ctx, AsyncWebServerRequest *req) {
         AsyncWebServerRequest *req = reinterpret_cast<AsyncWebServerRequest*>(reqPtr);
         return JS_NewString(ctx2, req->contentType().c_str());
     }, "contentType", 0);
-    JS_DefinePropertyValueStr(ctx, jsReq, "contentType", JS_DupValue(ctx, contentTypeFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsReq, "contentType", contentTypeFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
     
     // Add body() getter - returns body as string
     JSValue bodyFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -154,7 +162,7 @@ static JSValue wrapRequest(JSContext *ctx, AsyncWebServerRequest *req) {
         // For async handlers, we need to use onBody callback
         return JS_NewString(ctx2, ""); // Placeholder
     }, "body", 0);
-    JS_DefinePropertyValueStr(ctx, jsReq, "body", JS_DupValue(ctx, bodyFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsReq, "body", bodyFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
     
     return jsReq;
 }
@@ -199,7 +207,7 @@ static JSValue wrapResponse(JSContext *ctx, AsyncWebServerRequest *req, AsyncWeb
         if (argc >= 3) JS_FreeCString(ctx2, content);
         return JS_UNDEFINED;
     }, "send", 3);
-    JS_DefinePropertyValueStr(ctx, jsRes, "send", JS_DupValue(ctx, sendFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsRes, "send", sendFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
 
     // res.redirect(url, code?) - dispatches via req->redirect(...).
     JSValue redirectFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -220,7 +228,7 @@ static JSValue wrapResponse(JSContext *ctx, AsyncWebServerRequest *req, AsyncWeb
         JS_FreeCString(ctx2, url);
         return JS_UNDEFINED;
     }, "redirect", 2);
-    JS_DefinePropertyValueStr(ctx, jsRes, "redirect", JS_DupValue(ctx, redirectFunc), JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, jsRes, "redirect", redirectFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
 
     return jsRes;
 }
@@ -305,22 +313,17 @@ static JSValue makeRouteHandler(JSContext *ctx, JSValueConst this_obj, int argc,
         // which is what actually flushes the response to the wire.
         req->pause();
         pushPendingOp(PendingExecution{[handlerId, reqShared](JSContext* ctx) -> void* {
-            Serial.printf("[WebServer] Executing handler on JS thread, handlerId=%u\n", handlerId);
             AsyncWebServerRequest *req = reqShared.get();
             JSValue handler = JSStash_get(ctx, handlerId);
             if (!JS_IsUndefined(handler) && JS_IsFunction(ctx, handler)) {
-                Serial.printf("[WebServer] Handler is valid, wrapping request/response\n");
                 JSValue jsReq = wrapRequest(ctx, req);
                 // For response, we need to create a wrapper that can be used to send response
                 AsyncWebServerResponse *res = req->getResponse();
-                Serial.printf("[WebServer] Got response object: %p\n", res);
                 JSValue jsRes = wrapResponse(ctx, req, res);
                 JSValue argv[2] = { jsReq, jsRes };
                 JS_Call(ctx, handler, JS_UNDEFINED, 2, argv);
                 JS_FreeValue(ctx, jsReq);
                 JS_FreeValue(ctx, jsRes);
-            } else {
-                Serial.printf("[WebServer] Handler not found or not a function\n");
             }
             JS_FreeValue(ctx, handler);
             // reqShared is released when this lambda returns.
@@ -423,6 +426,50 @@ static JSValue makeCloseHandler(JSContext *ctx, JSValueConst this_obj, int argc,
     return JS_UNDEFINED;
 }
 
+// Helper: serve static files from a filesystem. uri is the URI prefix
+// to match (e.g. "/"); fs is the filesystem instance to read from; path is
+// the directory inside that filesystem (e.g. "/www"). Returns the route id
+// (same id-space as app.get/post/etc.) so the caller can later app.remove(id).
+// Pass nullptr for cache_control or pass a string like "max-age=3600".
+static JSValue makeServeStatic(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv, fs::FS &fs) {
+    AsyncWebServer *server = getServer(ctx, this_obj);
+    if (!server) {
+        return JS_ThrowTypeError(ctx, "Server instance not found");
+    }
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "Expected 2 arguments: uri, path");
+    }
+    size_t uriLen, pathLen;
+    const char *uri = JS_ToCStringLen(ctx, &uriLen, argv[0]);
+    if (!uri) {
+        return JS_ThrowTypeError(ctx, "Invalid uri argument");
+    }
+    const char *path = JS_ToCStringLen(ctx, &pathLen, argv[1]);
+    if (!path) {
+        JS_FreeCString(ctx, uri);
+        return JS_ThrowTypeError(ctx, "Invalid path argument");
+    }
+    const char *cache_control = nullptr;
+    char *cacheStr = nullptr;
+    if (argc >= 3 && JS_IsString(argv[2])) {
+        cacheStr = (char *)JS_ToCString(ctx, argv[2]);
+        cache_control = cacheStr;
+    }
+
+    AsyncStaticWebHandler &staticHandler = server->serveStatic(uri, fs, path, cache_control);
+
+    if (cacheStr) JS_FreeCString(ctx, cacheStr);
+    JS_FreeCString(ctx, uri);
+    JS_FreeCString(ctx, path);
+
+    // Assign a fresh id so app.remove(id) works.
+    uint32_t routeId = ++g_staticRouteIdCounter;
+    RouteHandlerEntry entry;
+    entry.handler = &staticHandler;  // AsyncStaticWebHandler -> AsyncWebHandler*
+    g_routeHandlers[routeId] = entry;
+    return JS_NewInt32(ctx, routeId);
+}
+
 // Helper: remove a route by its handlerId (the value returned from app.get,
 // app.post, etc.). Returns true if a handler was removed, false otherwise.
 static JSValue makeRemoveHandler(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv) {
@@ -441,7 +488,7 @@ static JSValue makeRemoveHandler(JSContext *ctx, JSValueConst this_obj, int argc
         return JS_NewBool(ctx, false);
     }
 
-    AsyncCallbackWebHandler *handler = nullptr;
+    AsyncWebHandler *handler = nullptr;
     if (g_routeHandlersMutex) xSemaphoreTake(g_routeHandlersMutex, portMAX_DELAY);
     auto it = g_routeHandlers.find((uint32_t)routeId);
     if (it != g_routeHandlers.end()) {
@@ -472,6 +519,8 @@ inline void initWebServer(JSContext *ctx, JSValue globalObj){
     useAtom = JS_NewAtom(ctx, "use");
     closeAtom = JS_NewAtom(ctx, "close");
     removeAtom = JS_NewAtom(ctx, "remove");
+    serveStaticAtom = JS_NewAtom(ctx, "serveStatic");
+    serveSDAtom = JS_NewAtom(ctx, "serveSD");
     // Register "express" as a constructor: let myServer = new express();
     JSValue expressConstructor = JS_NewCFunction2(ctx, [](JSContext *ctx, JSValueConst new_target,
               int argc, JSValueConst *argv) {
@@ -508,10 +557,28 @@ inline void initWebServer(JSContext *ctx, JSValue globalObj){
                 JS_DefinePropertyValue(ctx, new_obj, closeAtom, closeFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
 
                 // remove(routeId) - deregister a route by the id returned from
-                // app.get/post/put/delete/patch/all. Returns true if a handler
-                // was removed, false if no handler was registered for that id.
+                // app.get/post/put/delete/patch/all/serveStatic/serveSD. Returns
+                // true if a handler was removed, false if no handler was
+                // registered for that id.
                 JSValue removeFunc = JS_NewCFunction(ctx, makeRemoveHandler, "remove", 1);
                 JS_DefinePropertyValue(ctx, new_obj, removeAtom, removeFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+
+                // serveStatic(uri, path, [cache_control]) - serve files from
+                // LittleFS at the given URI prefix. Files under <path> on the
+                // filesystem are mapped to <uri>/* in the URL space. Returns
+                // a route id (use app.remove(id) to deregister).
+                JSValue serveStaticFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) -> JSValue {
+                    return makeServeStatic(ctx2, this_obj, argc, argv, LittleFS);
+                }, "serveStatic", 2);
+                JS_DefinePropertyValue(ctx, new_obj, serveStaticAtom, serveStaticFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+
+                // serveSD(uri, path, [cache_control]) - serve files from the
+                // SD card at the given URI prefix. Same signature/return as
+                // serveStatic.
+                JSValue serveSDFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) -> JSValue {
+                    return makeServeStatic(ctx2, this_obj, argc, argv, SD);
+                }, "serveSD", 2);
+                JS_DefinePropertyValue(ctx, new_obj, serveSDAtom, serveSDFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
 
                 // get(path, handler)
                 JSValue getFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) -> JSValue {
