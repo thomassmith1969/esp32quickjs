@@ -3,6 +3,17 @@
 #include <ESPAsyncWebServer.h>
 #include "JSStash.h"
 #include "JSQueue.h"
+#include <unordered_map>
+
+// Map from handlerId (returned by app.get/post/put/delete/patch/all) to the
+// AsyncCallbackWebHandler* that server->on() produced, so app.remove(handlerId)
+// can later call server->removeHandler(handler). Populated in
+// makeRouteHandler, consumed in makeRemoveHandler.
+struct RouteHandlerEntry {
+    AsyncCallbackWebHandler *handler = nullptr;
+};
+static std::unordered_map<uint32_t, RouteHandlerEntry> g_routeHandlers;
+static SemaphoreHandle_t g_routeHandlersMutex = xSemaphoreCreateMutex();
 
 // Forward declare for AsyncWebRequestMethod
 namespace AsyncWebRequestMethod {
@@ -24,6 +35,7 @@ static JSAtom patchAtom = JS_ATOM_NULL;
 static JSAtom allAtom = JS_ATOM_NULL;
 static JSAtom useAtom = JS_ATOM_NULL;
 static JSAtom closeAtom = JS_ATOM_NULL;
+static JSAtom removeAtom = JS_ATOM_NULL;
 
 
 // Wrap a raw ESPAsyncWebServer request pointer in a JS object whose only property is the
@@ -262,7 +274,11 @@ static JSValue makeRouteHandler(JSContext *ctx, JSValueConst this_obj, int argc,
     // would dangle once JS_FreeCString() runs; the lambda uses req->url() for
     // logging instead. (Previously the lambda captured `path` and was a
     // use-after-free — caused heap corruption under multi_heap poisoning.)
-    server->on(path, method, [handlerId](AsyncWebServerRequest *req) {
+    //
+    // We capture the AsyncCallbackWebHandler& returned by server->on() so that
+    // app.remove(handlerId) can later find the handler via the
+    // g_routeHandlers map and call server->removeHandler().
+    AsyncCallbackWebHandler &cbHandler = server->on(path, method, [handlerId](AsyncWebServerRequest *req) {
         Serial.printf("[WebServer] Request received: %s %s (handlerId=%u)\n",
                       req->methodToString(), req->url().c_str(), handlerId);
         // IMPORTANT: this lambda runs on AsyncTCP's task. We must not touch
@@ -311,6 +327,12 @@ static JSValue makeRouteHandler(JSContext *ctx, JSValueConst this_obj, int argc,
             return nullptr;
         }});
     });
+    // Record the handler pointer so app.remove(handlerId) can find it.
+    if (g_routeHandlersMutex) xSemaphoreTake(g_routeHandlersMutex, portMAX_DELAY);
+    RouteHandlerEntry entry;
+    entry.handler = &cbHandler;
+    g_routeHandlers[handlerId] = entry;
+    if (g_routeHandlersMutex) xSemaphoreGive(g_routeHandlersMutex);
     // server->on() copied the URI into its AsyncURIMatcher; safe to free now.
     JS_FreeCString(ctx, path);
 
@@ -401,6 +423,40 @@ static JSValue makeCloseHandler(JSContext *ctx, JSValueConst this_obj, int argc,
     return JS_UNDEFINED;
 }
 
+// Helper: remove a route by its handlerId (the value returned from app.get,
+// app.post, etc.). Returns true if a handler was removed, false otherwise.
+static JSValue makeRemoveHandler(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv) {
+    AsyncWebServer *server = getServer(ctx, this_obj);
+    if (!server) {
+        return JS_ThrowTypeError(ctx, "Server instance not found");
+    }
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "Expected 1 argument: routeId");
+    }
+    int64_t routeId = 0;
+    if (JS_ToInt64(ctx, &routeId, argv[0]) != 0) {
+        return JS_ThrowTypeError(ctx, "routeId must be an integer");
+    }
+    if (routeId <= 0) {
+        return JS_NewBool(ctx, false);
+    }
+
+    AsyncCallbackWebHandler *handler = nullptr;
+    if (g_routeHandlersMutex) xSemaphoreTake(g_routeHandlersMutex, portMAX_DELAY);
+    auto it = g_routeHandlers.find((uint32_t)routeId);
+    if (it != g_routeHandlers.end()) {
+        handler = it->second.handler;
+        g_routeHandlers.erase(it);
+    }
+    if (g_routeHandlersMutex) xSemaphoreGive(g_routeHandlersMutex);
+
+    if (!handler) {
+        return JS_NewBool(ctx, false);
+    }
+    bool removed = server->removeHandler(handler);
+    return JS_NewBool(ctx, removed);
+}
+
 inline void initWebServer(JSContext *ctx, JSValue globalObj){
     // Allocate atoms once for the lifetime of the runtime.
     serverInstanceAtom = JS_NewAtom(ctx, "_serverInstance");
@@ -415,6 +471,7 @@ inline void initWebServer(JSContext *ctx, JSValue globalObj){
     allAtom = JS_NewAtom(ctx, "all");
     useAtom = JS_NewAtom(ctx, "use");
     closeAtom = JS_NewAtom(ctx, "close");
+    removeAtom = JS_NewAtom(ctx, "remove");
     // Register "express" as a constructor: let myServer = new express();
     JSValue expressConstructor = JS_NewCFunction2(ctx, [](JSContext *ctx, JSValueConst new_target,
               int argc, JSValueConst *argv) {
@@ -449,6 +506,12 @@ inline void initWebServer(JSContext *ctx, JSValue globalObj){
                 // close() - stop the server
                 JSValue closeFunc = JS_NewCFunction(ctx, makeCloseHandler, "close", 0);
                 JS_DefinePropertyValue(ctx, new_obj, closeAtom, closeFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
+
+                // remove(routeId) - deregister a route by the id returned from
+                // app.get/post/put/delete/patch/all. Returns true if a handler
+                // was removed, false if no handler was registered for that id.
+                JSValue removeFunc = JS_NewCFunction(ctx, makeRemoveHandler, "remove", 1);
+                JS_DefinePropertyValue(ctx, new_obj, removeAtom, removeFunc, JS_PROP_WRITABLE | JS_PROP_ENUMERABLE);
 
                 // get(path, handler)
                 JSValue getFunc = JS_NewCFunction(ctx, [](JSContext *ctx2, JSValueConst this_obj, int argc, JSValueConst *argv) -> JSValue {
