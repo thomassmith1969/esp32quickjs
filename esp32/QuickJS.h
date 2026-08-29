@@ -78,8 +78,8 @@ extern int currentTelnetId;
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
-
 #include "../quickjs.h"
+#include "WebServer.h"
 
 static void qjs_dump_exception_to(JSContext *ctx, JSValue v, Print* out) {
   if (!out) out = &Serial;
@@ -1948,8 +1948,8 @@ class JSFileSystem {
     // Create promise and stash the resolving functions
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-    e->resolving_funcs[0] = JSStash::stash(ctx, resolving_funcs[0]);
-    e->resolving_funcs[1] = JSStash::stash(ctx, resolving_funcs[1]);
+    e->resolving_funcs[0] = JSStash_stash(ctx, resolving_funcs[0]);
+    e->resolving_funcs[1] = JSStash_stash(ctx, resolving_funcs[1]);
 
     e->workItem = new JSWorker::WorkItem{e, &JSFileSystem::processEntryCb, false};
     queue.push_back(e);
@@ -1967,19 +1967,19 @@ class JSFileSystem {
 
       if (e->ok) {
         JSValue val = JS_NewString(ctx, e->result.c_str());
-        JSValue resolveFunc = JSStash::get(ctx, e->resolving_funcs[0]);
+        JSValue resolveFunc = JSStash_get(ctx, e->resolving_funcs[0]);
         JS_Call(ctx, resolveFunc, JS_UNDEFINED, 1, &val);
         JS_FreeValue(ctx, val);
         JS_FreeValue(ctx, resolveFunc);
       } else {
         JSValue err = JS_NewString(ctx, e->error.c_str());
-        JSValue rejectFunc = JSStash::get(ctx, e->resolving_funcs[1]);
+        JSValue rejectFunc = JSStash_get(ctx, e->resolving_funcs[1]);
         JS_Call(ctx, rejectFunc, JS_UNDEFINED, 1, &err);
         JS_FreeValue(ctx, err);
         JS_FreeValue(ctx, rejectFunc);
       }
-      JSStash::release(ctx, e->resolving_funcs[0]);
-      JSStash::release(ctx, e->resolving_funcs[1]);
+      JSStash_release(ctx, e->resolving_funcs[0]);
+      JSStash_release(ctx, e->resolving_funcs[1]);
       it = queue.erase(it);
       delete e->workItem;
       delete e;
@@ -2458,9 +2458,7 @@ class ESP32QuickJS {
     JS_SetMaxStackSize(rt, (size_t)-1);  // effectively unlimited
     JSValue global = JS_GetGlobalObject(ctx);
     setup(ctx, global);
-    JS_FreeValue(ctx, global);
     // Initialize the non-blocking module loader (spawns FreeRTOS reader task).
-    JSStash::init();
     module_loader.init(ctx);
     // Initialize the centralized worker (one task for I2C/SPI/FS).
     JSWorker::instance = &worker;
@@ -2475,9 +2473,11 @@ class ESP32QuickJS {
     sd.init();
     motorDriver.analog = &analog;  // share LEDC allocator with analogWrite
     motorDriver.init();
+    initWebServer(ctx, global);
     // Wire the static trampoline so C callbacks can find this instance.
     JSEspNow::instance = &espNow;
     espNow.ctx = ctx;
+    JS_FreeValue(ctx, global);
   }
 
   void end() {
@@ -2544,6 +2544,9 @@ class ESP32QuickJS {
     // Telnet REPL: drain per-client buffers and pump incoming
     // connections. Owned entirely by the library.
     if (g_jstelnet) g_jstelnet->loop();
+
+    // HTTP/HTTPS/WS/SSE server: drive connection state machines.
+    loopWebServer(ctx);
 
     // Serial/UART data polling — fire onData callbacks when data arrives.
     // Non-blocking: available() returns 0 if nothing to read.
@@ -2821,8 +2824,7 @@ class ESP32QuickJS {
       qjs_->espNow.loop();
       qjs_->motorDriver.loop(ctx_);
       if (g_jstelnet) g_jstelnet->loop();
-
-      // Serial/UART data polling during blocking waits.
+      loopWebServer(ctx_);
       if (qjs_->serial1 && qjs_->serial1->available() > 0 && !JS_IsUndefined(qjs_->serial1Cb)) {
         String data;
         while (qjs_->serial1->available()) data += (char)qjs_->serial1->read();

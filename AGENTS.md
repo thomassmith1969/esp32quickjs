@@ -3,6 +3,7 @@
 These are NON-NEGOTIABLE rules for any C++ work in `esp32/`. Breaking
 any of these has crashed the runtime or produced subtle lifetime bugs.
 
+
 ## 1. Never store `JSContext*`
 
 - `JSContext*` is a per-runtime handle that can be torn down.
@@ -49,15 +50,6 @@ JS_EnqueueJob(ctx, [](JSContext *ctx, int argc, JSValueConst *argv) -> JSValue {
   request. They set a flag; the JS-thread loop notices and resolves
   the relevant Promise.
 
-## 5. Existing patterns to follow
-
-- `JSMotorDriver`, `JSRotaryEncoder` — typed class with
-  `JS_NewObjectClass` + `JS_SetOpaque` + finalizer that frees.
-- `JSRepl.cpp` `requireSync()` — the canonical example of
-  `JS_EnqueueJob` for non-JS-thread work.
-- `JSTelnetServer` — AsyncClient per-client with `onConnect /
-  onData / onDisconnect` trampolines that only buffer bytes; the
-  JS-thread loop reads the buffers.
 
 ## 6. When in doubt
 

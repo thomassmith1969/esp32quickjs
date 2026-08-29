@@ -26,7 +26,6 @@
 #include <map>
 #include <stack>
 #include "../quickjs.h"
-#include "JSStash.h"  // not strictly needed; included for header parity
 
 // Forward declaration so we don't have to drag the whole QuickJS.h in.
 class ESP32QuickJS;

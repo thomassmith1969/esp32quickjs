@@ -32,7 +32,7 @@ namespace {
         xSemaphoreGive(g_promiseMutex);
 
         for (auto& op : ops) {
-            JSValue arr = JSStash::get(ctx, op.id);
+            JSValue arr = JSStash_get(ctx, op.id);
             if (JS_IsUndefined(arr)) continue;
 
             JSValue resolve = JS_GetPropertyUint32(ctx, arr, 1);
@@ -52,7 +52,7 @@ namespace {
             JS_FreeValue(ctx, resolve);
             JS_FreeValue(ctx, reject);
             JS_FreeValue(ctx, arr);
-            JSStash::release(ctx, op.id);
+            JSStash_release(ctx, op.id);
         }
         return JS_UNDEFINED;
     }
@@ -73,13 +73,13 @@ static uint32_t createPromise(JSContext* ctx) {
     JS_SetPropertyUint32(ctx, arr, 1, resolving_funcs[0]);
     JS_SetPropertyUint32(ctx, arr, 2, resolving_funcs[1]);
 
-    return JSStash::stash(ctx, arr);
+    return JSStash_stash(ctx, arr);
 }
 
 // 2. getPromise - gets the stashed promise by ID
 static JSValue getPromise(JSContext* ctx, uint32_t id) {
     if (id == 0) return JS_UNDEFINED;
-    JSValue arr = JSStash::get(ctx, id);
+    JSValue arr = JSStash_get(ctx, id);
     if (JS_IsUndefined(arr)) return JS_UNDEFINED;
     JSValue promise = JS_GetPropertyUint32(ctx, arr, 0);
     JS_FreeValue(ctx, arr);
